@@ -9,11 +9,12 @@
 use std::rc::Rc;
 use std::time::Instant;
 
+use mw_agents::habits::{HabitContext, HabitSoul, HabitStats};
 use mw_agents::memory::{Memory, OPINION_ONE};
 use mw_agents::obs::N_STATS;
 use mw_agents::persona::{trait_idx, Persona};
 use mw_agents::soul::{Body, Choice, Social, ToolSem, UtilitySoul, TOOL_SLOTS};
-use mw_core::{EntityId, Intent, World};
+use mw_core::{AgentRng, EntityId, Intent, Observation, SoulPolicy, World};
 use mw_village::{tile_at, verb, Action, Item, Tile, VillagePack, GRID, MAX_NEED, TOOL_COUNT};
 
 /// Soak parameters.
@@ -33,7 +34,6 @@ impl Default for SoakConfig {
         }
     }
 }
-
 /// What the run produced. Everything here is deterministic in `(seed, agents,
 /// ticks)` except `elapsed_secs` (a throughput measurement, report-only).
 #[derive(Clone, Debug)]
@@ -43,16 +43,16 @@ pub struct SoakReport {
     pub deaths: usize,
     pub final_hash: u64,
     pub elapsed_secs: f64,
-    /// Per-tick sum of every agent's projected (hunger, energy, social),
-    /// accumulated across the whole run. Divided by `ticks * agents` it is the
-    /// time-averaged mean need level — the reference the cold fast-forward drift
-    /// test compares against. Deterministic in `(seed, agents, ticks)`.
+    /// Per-tick sum of every agent's projected (hunger, energy, social).
     pub sum_needs: [u128; N_STATS],
+    pub habits_enabled: bool,
+    pub habit_stats: HabitStats,
+    pub habit_cache_sizes: Vec<usize>,
 }
 
 impl SoakReport {
     pub fn total_actions(&self) -> u64 {
-        self.histogram.iter().sum()
+        self.histogram.iter().sum::<u64>() + self.habit_stats.hits
     }
 
     pub fn ticks_per_sec(&self) -> f64 {
@@ -175,6 +175,75 @@ impl Body for VillageBody {
                 Some(tp) => step_toward(from, tp, true),
                 None => Intent::Idle,
             },
+        }
+    }
+}
+
+type VillageSoul = UtilitySoul<VillageBody>;
+
+enum ActiveSoul {
+    Plain(VillageSoul),
+    Habits(HabitSoul<VillageSoul>),
+}
+
+impl SoulPolicy for ActiveSoul {
+    fn decide(&mut self, obs: &Observation, rng: &mut AgentRng) -> Intent {
+        match self {
+            Self::Plain(s) => s.decide(obs, rng),
+            Self::Habits(s) => s.decide(obs, rng),
+        }
+    }
+}
+
+impl ActiveSoul {
+    fn snapshot(&mut self, world: &World) {
+        match self {
+            Self::Plain(s) => s.snapshot(world),
+            Self::Habits(s) => s.inner_mut().snapshot(world),
+        }
+    }
+
+    fn set_context(&mut self, id: EntityId, context: HabitContext) {
+        if let Self::Habits(s) = self {
+            s.set_context(id, context);
+        }
+    }
+
+    fn observe_events(&mut self, events: &[mw_core::Event]) {
+        match self {
+            Self::Plain(s) => s.observe_events(events),
+            Self::Habits(s) => {
+                s.inner_mut().observe_events(events);
+                s.observe_events(events);
+            }
+        }
+    }
+
+    fn decay_opinions(&mut self) {
+        match self {
+            Self::Plain(s) => s.decay_opinions(),
+            Self::Habits(s) => s.inner_mut().decay_opinions(),
+        }
+    }
+
+    fn histogram(&self) -> &[u64; TOOL_SLOTS] {
+        match self {
+            Self::Plain(s) => s.histogram(),
+            Self::Habits(s) => s.inner().histogram(),
+        }
+    }
+
+    fn habit_stats(&self) -> HabitStats {
+        match self {
+            Self::Plain(_) => HabitStats::default(),
+            Self::Habits(s) => s.stats(),
+        }
+    }
+
+    fn cache_sizes(&self) -> Vec<usize> {
+        match self {
+            Self::Plain(_) => Vec::new(),
+            Self::Habits(s) => s.cache_sizes(),
         }
     }
 }
@@ -344,8 +413,14 @@ pub fn verb_affect() -> Vec<(u32, i32, i32)> {
 // inventories, ground items) via `ScenarioPack::hash_state`, so positions and
 // the social/economic state are covered by one hash that replay must reproduce.
 
-/// Run the soak and return its report.
+/// Run the soak with habits enabled (the default production path).
 pub fn run(cfg: SoakConfig) -> SoakReport {
+    run_with_habits(cfg, true)
+}
+
+/// Run an A/B soak. Habit cache state is simulation state, but elapsed time is
+/// deliberately report-only and never influences the hash.
+pub fn run_with_habits(cfg: SoakConfig, habits: bool) -> SoakReport {
     let pack = Rc::new(VillagePack::new());
     let mut world = World::with_pack(cfg.seed, &*pack);
 
@@ -359,7 +434,7 @@ pub fn run(cfg: SoakConfig) -> SoakReport {
         .collect();
 
     let body = VillageBody::new(Rc::clone(&pack), factions);
-    let mut soul = UtilitySoul::new(
+    let utility = UtilitySoul::new(
         body,
         tool_table(),
         ids.clone(),
@@ -367,20 +442,46 @@ pub fn run(cfg: SoakConfig) -> SoakReport {
         memories,
         positions,
     );
+    let mut soul = if habits {
+        ActiveSoul::Habits(HabitSoul::with_hit_hook(
+            utility,
+            ids.clone(),
+            UtilitySoul::<VillageBody>::habit_replay,
+        ))
+    } else {
+        ActiveSoul::Plain(utility)
+    };
 
     let mut last_events = 0usize;
     let mut sum_needs = [0u128; N_STATS];
     let t0 = Instant::now();
     for _ in 0..cfg.ticks {
-        // Snapshot before stepping: positions are frozen within a tick, so one
-        // snapshot serves every decision that tick.
+        for &id in &ids {
+            let (h, en, so) = pack.needs(id).project(world.tick());
+            let pos = world.entity(id).map(|e| e.pos).unwrap_or_default();
+            let cell_class = match tile_at(pos) {
+                Tile::Empty => 0,
+                Tile::Home => 1,
+                Tile::Bakery => 2,
+                Tile::Well => 3,
+                Tile::Field => 4,
+            };
+            soul.set_context(
+                id,
+                HabitContext {
+                    needs: [h as i16, en as i16, so as i16],
+                    need_max: MAX_NEED as i16,
+                    cell_class,
+                    goal: 0,
+                },
+            );
+        }
         soul.snapshot(&world);
         world.step(&*pack, &mut soul);
         let events = world.event_log();
         soul.observe_events(&events[last_events..]);
         last_events = events.len();
         soul.decay_opinions();
-        // Sample the post-tick need trajectory for the mean-need reference.
         let t = world.tick();
         for &id in &ids {
             let (h, en, so) = pack.needs(id).project(t);
@@ -390,7 +491,6 @@ pub fn run(cfg: SoakConfig) -> SoakReport {
         }
     }
     let elapsed_secs = t0.elapsed().as_secs_f64();
-
     let deaths = ids.iter().filter(|&&id| pack.is_dead(&world, id)).count();
     let final_hash = world.state_hash(&*pack);
     SoakReport {
@@ -400,5 +500,8 @@ pub fn run(cfg: SoakConfig) -> SoakReport {
         final_hash,
         elapsed_secs,
         sum_needs,
+        habits_enabled: habits,
+        habit_stats: soul.habit_stats(),
+        habit_cache_sizes: soul.cache_sizes(),
     }
 }

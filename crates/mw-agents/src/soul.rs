@@ -164,6 +164,19 @@ impl<B: Body> UtilitySoul<B> {
         }
     }
 
+    pub fn habit_skip(&mut self, obs: &Observation) {
+        if self.last_tick != Some(obs.tick) {
+            self.last_tick = Some(obs.tick);
+            self.cursor = 0;
+        }
+        self.cursor += 1;
+    }
+
+    /// Advance the cursor for a replayed action without running observe/score.
+    pub fn habit_replay(&mut self, obs: &Observation, _intent: &Intent) {
+        self.habit_skip(obs);
+    }
+
     /// Feed the tick's new events into memory, routed to the involved parties.
     pub fn observe_events(&mut self, events: &[Event]) {
         for ev in events {

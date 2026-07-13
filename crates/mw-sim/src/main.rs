@@ -5,13 +5,19 @@
 //! utility-SOUL + memory loop and reports throughput, an action histogram,
 //! deaths, and a final state hash.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use mw_agents::dialogue::{DialogueRenderer, FocusPoint, MockRenderer};
 use mw_core::{AgentRng, Intent, KernelPack, Observation, SoulPolicy, World};
 use mw_sim::dialogue::{demo, LlamaDialogue, Scene};
 use mw_sim::director::{self, FfConfig, TICKS_PER_DAY};
 use mw_sim::soak::{self, SoakConfig};
 use mw_text::{Config, LlamaServerBackend};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HabitsFlag {
+    On,
+    Off,
+}
 
 #[derive(Parser)]
 #[command(about = "mini-world headless kernel runner")]
@@ -39,6 +45,9 @@ enum Command {
         agents: i32,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// Replay routine decisions from the per-agent habit cache.
+        #[arg(long, value_enum, default_value_t = HabitsFlag::On)]
+        habits: HabitsFlag,
     },
     /// Analytic AFK fast-forward: advance the village by an in-game span using
     /// the cold LOD ring, then print the returning-player digest.
@@ -111,21 +120,34 @@ fn run_kernel(ticks: u64, entities: i32, seed: u64) {
     );
 }
 
-fn run_soak(ticks: u64, agents: i32, seed: u64) {
-    let report = soak::run(SoakConfig {
-        seed,
-        agents,
-        ticks,
-    });
+fn run_soak(ticks: u64, agents: i32, seed: u64, habits: bool) {
+    let report = soak::run_with_habits(
+        SoakConfig {
+            seed,
+            agents,
+            ticks,
+        },
+        habits,
+    );
     println!(
-        "soak seed={} agents={} ticks={}",
-        report.cfg.seed, report.cfg.agents, report.cfg.ticks
+        "soak seed={} agents={} ticks={} habits={}",
+        report.cfg.seed, report.cfg.agents, report.cfg.ticks, habits
     );
     println!(
         "ticks/sec={:.0} actions={} deaths={} (starvation)",
         report.ticks_per_sec(),
         report.total_actions(),
         report.deaths,
+    );
+    let hs = report.habit_stats;
+    println!(
+        "habits hits={} misses={} invalidations={} skipped={} hit_rate={:.1}% cache_entries={}",
+        hs.hits,
+        hs.misses,
+        hs.invalidations,
+        hs.scoring_calls_skipped,
+        100.0 * hs.hit_rate(),
+        report.habit_cache_sizes.iter().sum::<usize>(),
     );
     println!("final_hash={:#018x}", report.final_hash);
     let m = report.mean_needs();
@@ -233,7 +255,8 @@ fn main() {
             ticks,
             agents,
             seed,
-        } => run_soak(ticks, agents, seed),
+            habits,
+        } => run_soak(ticks, agents, seed, matches!(habits, HabitsFlag::On)),
         Command::Ff { days, agents, seed } => run_ff(days, agents, seed),
         Command::View {
             smoke,

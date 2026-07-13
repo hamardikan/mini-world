@@ -7,6 +7,9 @@
 //! a distilled net drops into later (DESIGN.md §5).
 
 pub mod dialogue;
+pub mod habits;
+/// Singular alias retained for the DESIGN.md building-block name.
+pub use habits as habit;
 pub mod memory;
 pub mod obs;
 pub mod persona;
@@ -15,6 +18,9 @@ pub mod soul;
 pub use dialogue::{
     Conversation, ConversationLog, DialogueRenderer, FocusPoint, MockRenderer, PersonaCard,
     PersonaRegistry, RenderRequest, SliceRegistry, Vocab,
+};
+pub use habits::{
+    HabitCache, HabitContext, HabitKey, HabitSoul, HabitStats, HABIT_CAPACITY, NEED_BANDS,
 };
 pub use obs::{AgentObs, Goal, NeighborView, K_NEIGHBORS, NEED_ONE, N_EVENT_KINDS, N_STATS};
 pub use persona::{Persona, N_FACTIONS, N_TRAITS, N_WEIGHTS, PERSONA_ONE};

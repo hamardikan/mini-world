@@ -37,6 +37,7 @@ use mw_agents::dialogue::{
     ConversationLog, DialogueRenderer, FocusPoint, MockRenderer, PersonaCard, PersonaRegistry,
     SliceRegistry, Vocab,
 };
+use mw_agents::habits::{HabitContext, HabitSoul};
 use mw_agents::memory::{Memory, OPINION_ONE};
 use mw_agents::persona::Persona;
 use mw_agents::soul::UtilitySoul;
@@ -197,7 +198,7 @@ pub struct App {
     world: World,
     ids: Vec<EntityId>,
     positions: Vec<(i32, i32)>,
-    soul: UtilitySoul<VillageBody>,
+    soul: HabitSoul<UtilitySoul<VillageBody>>,
     director: Director,
     registry: SliceRegistry,
     vocab: Vocab,
@@ -231,13 +232,17 @@ impl App {
             .collect();
         let registry = SliceRegistry::village(&personas);
         let body = VillageBody::new(Rc::clone(&pack), factions);
-        let soul = UtilitySoul::new(
-            body,
-            soak::tool_table(),
+        let soul = HabitSoul::with_hit_hook(
+            UtilitySoul::new(
+                body,
+                soak::tool_table(),
+                ids.clone(),
+                personas,
+                memories,
+                positions.clone(),
+            ),
             ids.clone(),
-            personas,
-            memories,
-            positions.clone(),
+            UtilitySoul::<VillageBody>::habit_replay,
         );
         let director = Director::new(RingConfig::default(), ids.len(), (8, 8));
         // The live backend is expensive (spawns llama-server + model); only pay
@@ -290,10 +295,30 @@ impl App {
     /// the conversation ledger, and the feed, refresh the director rings, then
     /// render any conversation the focus now observes (attention-gating).
     fn step(&mut self) {
-        self.soul.snapshot(&self.world);
         // LOD gate: only hot (every tick) and warm (on cadence) entities run
         // SOUL; cold entities idle-extrapolate. The director's rings were set by
         // the previous tick's update, so they gate this tick's decisions.
+        for &id in &self.ids {
+            let (h, en, so) = self.pack.needs(id).project(self.world.tick());
+            let pos = self.world.entity(id).map(|e| e.pos).unwrap_or_default();
+            let cell_class = match tile_at(pos) {
+                Tile::Empty => 0,
+                Tile::Home => 1,
+                Tile::Bakery => 2,
+                Tile::Well => 3,
+                Tile::Field => 4,
+            };
+            self.soul.set_context(
+                id,
+                HabitContext {
+                    needs: [h as i16, en as i16, so as i16],
+                    need_max: MAX_NEED as i16,
+                    cell_class,
+                    goal: 0,
+                },
+            );
+        }
+        self.soul.inner_mut().snapshot(&self.world);
         let director = &self.director;
         self.world
             .step_gated(&*self.pack, &mut self.soul, |id, tick| {
@@ -304,6 +329,7 @@ impl App {
         // we touch other fields.
         let new: Vec<Event> = self.world.event_log()[self.last_events..end].to_vec();
         self.last_events = end;
+        self.soul.inner_mut().observe_events(&new);
         self.soul.observe_events(&new);
         let tick = self.world.tick();
         for ev in &new {
@@ -315,7 +341,7 @@ impl App {
                 self.director.note_event(actor(ev).index() as usize, tick);
             }
         }
-        self.soul.decay_opinions();
+        self.soul.inner_mut().decay_opinions();
         for (slot, &id) in self.ids.iter().enumerate() {
             if let Some(e) = self.world.entity(id) {
                 self.positions[slot] = e.pos;
@@ -636,19 +662,27 @@ fn render_map(f: &mut Frame, area: Rect, app: &App) {
         let mut spans = Vec::with_capacity(GRID as usize);
         for x in 0..GRID {
             let is_focus = (x, y) == app.focus;
+            let tile = tile_at((x, y));
             let span = if let Some(slot) = occ[(y * GRID + x) as usize] {
-                let ring = app.director.ring(slot);
-                let name = &app.registry.card(app.ids[slot]).name;
-                let glyph = name.chars().next().unwrap_or('@');
-                let mut style = Style::default()
-                    .fg(ring_color(ring))
-                    .add_modifier(Modifier::BOLD);
-                if slot == app.selected {
-                    style = style.add_modifier(Modifier::REVERSED);
+                // Keep landmark glyphs visible even when an agent occupies the
+                // cell; the inspector still identifies the selected occupant.
+                if matches!(tile, Tile::Home | Tile::Bakery) {
+                    let (ch, color) = tile_glyph(tile);
+                    Span::styled(ch.to_string(), Style::default().fg(color))
+                } else {
+                    let ring = app.director.ring(slot);
+                    let name = &app.registry.card(app.ids[slot]).name;
+                    let glyph = name.chars().next().unwrap_or('@');
+                    let mut style = Style::default()
+                        .fg(ring_color(ring))
+                        .add_modifier(Modifier::BOLD);
+                    if slot == app.selected {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    Span::styled(glyph.to_string(), style)
                 }
-                Span::styled(glyph.to_string(), style)
             } else {
-                let (ch, color) = tile_glyph(tile_at((x, y)));
+                let (ch, color) = tile_glyph(tile);
                 let mut style = Style::default().fg(color);
                 if is_focus {
                     style = style.bg(Color::DarkGray);
@@ -679,7 +713,7 @@ fn render_inspector(f: &mut Frame, area: Rect, app: &App) {
     let id = app.ids[s];
     let tick = app.world.tick();
     let card = app.registry.card(id);
-    let mem = app.soul.memory(s);
+    let mem = app.soul.inner().memory(s);
     let (h, en, so) = app.pack.needs(id).project(tick);
 
     let mut lines = vec![
