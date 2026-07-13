@@ -283,7 +283,9 @@ name = "mw-sim"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "mw-agents",
  "mw-core",
+ "mw-village",
 ]
 
 [[package]]

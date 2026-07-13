@@ -80,6 +80,15 @@ impl VillagePack {
         st.inv[entity.index() as usize][item as usize]
     }
 
+    /// Dropped-item counts on the tile at `pos` (`[0; _]` off-map) — lets a
+    /// brain pick a valid `pickup` item instead of guessing.
+    pub fn ground_at(&self, pos: (i32, i32)) -> [u8; ITEM_COUNT] {
+        if !map::in_bounds(pos) {
+            return [0; ITEM_COUNT];
+        }
+        self.state.borrow().ground[map::index(pos)]
+    }
+
     /// Whether an entity has starved to death by the world's tick.
     pub fn is_dead(&self, world: &World, entity: EntityId) -> bool {
         self.needs(entity).dead(world.tick())
@@ -292,6 +301,13 @@ impl ScenarioPack for VillagePack {
         registry.register("hunger");
         registry.register("energy");
         registry.register("social");
+    }
+
+    // The seam: route the kernel's affordance query to this pack's body-state
+    // mask. Delegates to the inherent method so direct callers (tests, UI) keep
+    // working unchanged.
+    fn afforded_tools(&self, world: &World, entity: EntityId) -> u32 {
+        VillagePack::afforded_tools(self, world, entity)
     }
 }
 

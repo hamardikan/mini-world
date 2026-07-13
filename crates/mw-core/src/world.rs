@@ -114,8 +114,11 @@ impl World {
             self_pos,
             neighbors,
             event_count: self.event_log.len() as u64,
-            // v0 affords every kernel tool; packs will mask this per body state.
-            tool_mask: 0b1111,
+            // Base observation: affordances are a pack concern, so the mask is
+            // left empty here and filled by `step` via `ScenarioPack::afforded_tools`
+            // (the seam). Packs may call `observe` to read neighbor proximity
+            // without recursing back into affordance masking.
+            tool_mask: 0,
         }
     }
 
@@ -125,7 +128,8 @@ impl World {
         let ids: Vec<EntityId> = self.entities.ids().collect();
         let mut batch = Vec::with_capacity(ids.len());
         for id in ids {
-            let observation = self.observe(id);
+            let mut observation = self.observe(id);
+            observation.tool_mask = pack.afforded_tools(self, id);
             let mut rng = self.agent_rng(id, stream::SOUL);
             batch.push((id, policy.decide(&observation, &mut rng)));
         }

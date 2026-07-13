@@ -1,18 +1,16 @@
-//! SOUL policies — skeleton.
+//! SOUL policies and the character state they run on.
 //!
-//! Home of the [`SoulPolicy`] implementations: the v0 utility-AI scorer, later
-//! the distilled tiny net. Both sit behind the same contract. No behavior yet.
+//! The brain layer of the platform: the deterministic [`persona`] a character
+//! is conditioned on, the fixed-size [`obs`] encoder that turns world + memory
+//! into the SOUL's input, tier-1 [`memory`], and the v0 [`soul::UtilitySoul`] —
+//! a hand-written utility scorer behind the same [`mw_core::SoulPolicy`] socket
+//! a distilled net drops into later (DESIGN.md §5).
 
 pub mod memory;
+pub mod obs;
+pub mod persona;
+pub mod soul;
 
-use mw_core::{AgentRng, Intent, Observation, SoulPolicy};
-
-/// v0 hand-written utility-AI scorer (DESIGN.md §5 training roadmap).
-#[derive(Default)]
-pub struct UtilityPolicy;
-
-impl SoulPolicy for UtilityPolicy {
-    fn decide(&mut self, _observation: &Observation, _rng: &mut AgentRng) -> Intent {
-        todo!("utility scoring over the afforded-tool mask")
-    }
-}
+pub use obs::{AgentObs, Goal, NeighborView, K_NEIGHBORS, NEED_ONE, N_EVENT_KINDS, N_STATS};
+pub use persona::{Persona, N_FACTIONS, N_TRAITS, N_WEIGHTS, PERSONA_ONE};
+pub use soul::{Body, Choice, Social, ToolSem, UtilitySoul, TOOL_SLOTS};

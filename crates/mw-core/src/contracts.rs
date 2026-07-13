@@ -65,6 +65,20 @@ pub trait ScenarioPack {
 
     /// Declare the needs/stats this pack tracks. Called once at world init.
     fn register(&self, registry: &mut StatRegistry);
+
+    /// Bitmask of tools `entity`'s body currently affords (bit `i` = tool id
+    /// `i`). The kernel calls this when building an [`Observation`] so a brain
+    /// only ever sees the legal subset — this is the seam that lets the pack
+    /// drive affordance masking instead of the kernel hardcoding it. Default:
+    /// the whole manifest is afforded; packs override per body state.
+    fn afforded_tools(&self, _world: &World, _entity: EntityId) -> u32 {
+        let n = self.manifest().tools.len();
+        if n >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << n) - 1
+        }
+    }
 }
 
 /// A character's brain. Given a fixed-shape observation and its own RNG stream,
