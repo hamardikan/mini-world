@@ -25,7 +25,9 @@ use std::time::Instant;
 
 use mw_agents::persona::{trait_idx, Persona, PERSONA_ONE};
 use mw_core::{agent_rng, EntityId, StreamTag, World};
-use mw_village::{VillagePack, MAX_NEED, STARVE_TICKS};
+use mw_village::{
+    VillagePack, MAINTENANCE_CYCLE, MAINTENANCE_GAIN, MAX_NEED, NEED_DECAY, STARVE_TICKS,
+};
 
 use crate::soak::start_positions;
 
@@ -182,15 +184,12 @@ impl Director {
 // `state += rate·min(Δt, cap)`, `cycles = floor(Δt / cycle)` resolution of
 // DESIGN §10, calibrated so cold trajectories track the hot ones (drift test).
 
-/// Per-tick decay, indexed [hunger, energy, social].
-const DECAY: [i64; 3] = [2, 1, 3];
-/// Restore delivered by one maintenance cycle (eat / sleep / socialize).
-const GAIN: [i64; 3] = [600, 500, 300];
-/// Maintenance period per need = how often the agent tops it up. Each is
-/// sustainable (`GAIN >= DECAY * CYCLE`, so restore offsets a cycle of decay)
-/// and tuned so the resulting sawtooth's mean tracks the hot policy's steady
-/// need levels (the drift gate). Hunger's period is persona-scaled below.
-const CYCLE: [u64; 3] = [160, 360, 100];
+/// Per-tick decay and maintenance gains come from the installed village pack;
+/// the analytic path has no shadow calibration constants.
+const DECAY: [i64; 3] = NEED_DECAY;
+const GAIN: [i64; 3] = MAINTENANCE_GAIN;
+/// Maintenance period per need, calibrated by the pack alongside its gains.
+const CYCLE: [u64; 3] = MAINTENANCE_CYCLE;
 /// A need dipping below this at a trough is a "crisis" worth logging.
 const CRISIS: i64 = 150;
 /// Largest slice of ticks resolved in one analytic step — the `cap` above. It
@@ -309,9 +308,9 @@ pub fn reconstruct_hot(cold_needs: [i64; 3]) -> [i16; 3] {
 /// already-starving world).
 fn hunger_cycle(p: &Persona) -> u64 {
     let ind = p.traits[trait_idx::INDUSTRIOUSNESS].clamp(0, PERSONA_ONE) as u64;
-    // slack in [0, 90]: least-industrious → +90 (period 250, mean ~750),
-    // most-industrious → +0 (period 160, mean ~840).
-    let slack = 90 * (PERSONA_ONE as u64 - ind) / PERSONA_ONE as u64;
+    // With the pack's EAT_GAIN=400 and hunger decay=2, every period must stay
+    // at or below 200 ticks to remain sustainable.
+    let slack = 40 * (PERSONA_ONE as u64 - ind) / PERSONA_ONE as u64;
     CYCLE[0] + slack
 }
 

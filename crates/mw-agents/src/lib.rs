@@ -20,7 +20,8 @@ pub use dialogue::{
     PersonaRegistry, RenderRequest, SliceRegistry, Vocab,
 };
 pub use habits::{
-    HabitCache, HabitContext, HabitKey, HabitSoul, HabitStats, HABIT_CAPACITY, NEED_BANDS,
+    HabitCache, HabitContext, HabitKey, HabitSoul, HabitStats, HABIT_CAPACITY, HABIT_TTL,
+    NEED_BANDS,
 };
 pub use obs::{AgentObs, Goal, NeighborView, K_NEIGHBORS, NEED_ONE, N_EVENT_KINDS, N_STATS};
 pub use persona::{Persona, N_FACTIONS, N_TRAITS, N_WEIGHTS, PERSONA_ONE};

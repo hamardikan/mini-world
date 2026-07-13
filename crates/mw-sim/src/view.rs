@@ -232,7 +232,7 @@ impl App {
             .collect();
         let registry = SliceRegistry::village(&personas);
         let body = VillageBody::new(Rc::clone(&pack), factions);
-        let soul = HabitSoul::with_hit_hook(
+        let soul = HabitSoul::with_hit_hook_and_tool(
             UtilitySoul::new(
                 body,
                 soak::tool_table(),
@@ -242,7 +242,8 @@ impl App {
                 positions.clone(),
             ),
             ids.clone(),
-            UtilitySoul::<VillageBody>::habit_replay,
+            UtilitySoul::<VillageBody>::habit_replay_tool,
+            UtilitySoul::<VillageBody>::last_tool,
         );
         let director = Director::new(RingConfig::default(), ids.len(), (8, 8));
         // The live backend is expensive (spawns llama-server + model); only pay

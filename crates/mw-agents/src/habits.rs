@@ -15,6 +15,9 @@ pub const N_NEEDS: usize = 3;
 pub const NEED_BANDS: u8 = 4;
 /// Maximum entries retained by one character.
 pub const HABIT_CAPACITY: usize = 32;
+/// Routine intents are replayed only for a bounded window. This prevents a
+/// cached idle decision from suppressing newly urgent/social behavior forever.
+pub const HABIT_TTL: u64 = 512;
 
 /// Compact, deterministic context key for one cached decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -84,7 +87,9 @@ impl HabitContext {
 struct Entry {
     key: HabitKey,
     intent: Intent,
+    tool: Option<u32>,
     stamp: u64,
+    tick: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,6 +127,7 @@ impl HabitStats {
 /// advance their call cursor without running observe/score work.
 pub struct HabitSoul<P: SoulPolicy> {
     inner: P,
+    ids: Vec<EntityId>,
     caches: Vec<AgentCache>,
     contexts: Vec<HabitContext>,
     last_tick: Option<u64>,
@@ -129,16 +135,18 @@ pub struct HabitSoul<P: SoulPolicy> {
     stamp: u64,
     stats: HabitStats,
     hit_hook: Option<fn(&mut P, &Observation, &Intent)>,
+    tool_getter: Option<fn(&P) -> Option<u32>>,
+    tool_hit_hook: Option<fn(&mut P, &Observation, &Intent, u32)>,
 }
 
-/// Naming used by the design block; `HabitSoul` is the policy-facing wrapper.
 pub type HabitCache<P> = HabitSoul<P>;
-
+/// Naming used by the design block; `HabitSoul` is the policy-facing wrapper.
 impl<P: SoulPolicy> HabitSoul<P> {
     pub fn new(inner: P, ids: Vec<EntityId>) -> Self {
         let n = ids.len();
         Self {
             inner,
+            ids,
             caches: vec![AgentCache::default(); n],
             contexts: vec![HabitContext::default(); n],
             last_tick: None,
@@ -146,6 +154,8 @@ impl<P: SoulPolicy> HabitSoul<P> {
             stamp: 0,
             stats: HabitStats::default(),
             hit_hook: None,
+            tool_getter: None,
+            tool_hit_hook: None,
         }
     }
 
@@ -157,6 +167,20 @@ impl<P: SoulPolicy> HabitSoul<P> {
     ) -> Self {
         let mut this = Self::new(inner, ids);
         this.hit_hook = Some(hook);
+        this
+    }
+
+    /// Construct with exact tool attribution for carrier intents (Move can
+    /// represent move/follow/flee). The getter runs only after a scorer miss.
+    pub fn with_hit_hook_and_tool(
+        inner: P,
+        ids: Vec<EntityId>,
+        hook: fn(&mut P, &Observation, &Intent, u32),
+        getter: fn(&P) -> Option<u32>,
+    ) -> Self {
+        let mut this = Self::new(inner, ids);
+        this.tool_getter = Some(getter);
+        this.tool_hit_hook = Some(hook);
         this
     }
     pub fn inner(&self) -> &P {
@@ -186,16 +210,21 @@ impl<P: SoulPolicy> HabitSoul<P> {
         if let Some(cache) = self.caches.get_mut(slot) {
             let old = cache.context.replace(context);
             if old.is_some_and(|old| {
-                HabitKey::from_needs(old.needs, old.need_max, old.cell_class, 0, old.goal)
-                    .need_bands
-                    != HabitKey::from_needs(
-                        context.needs,
-                        context.need_max,
-                        context.cell_class,
-                        0,
-                        context.goal,
-                    )
-                    .need_bands
+                let old_key =
+                    HabitKey::from_needs(old.needs, old.need_max, old.cell_class, 0, old.goal);
+                let new_key = HabitKey::from_needs(
+                    context.needs,
+                    context.need_max,
+                    context.cell_class,
+                    0,
+                    context.goal,
+                );
+                let urgency_edge = old
+                    .needs
+                    .iter()
+                    .zip(context.needs)
+                    .any(|(&before, after)| (before > 100) != (after > 100));
+                old_key.need_bands != new_key.need_bands || urgency_edge
             }) {
                 cache.entries.clear();
             }
@@ -228,17 +257,22 @@ impl<P: SoulPolicy> HabitSoul<P> {
     /// left intact; social/economic events can swing opinions or targets.
     pub fn observe_events(&mut self, events: &[Event]) {
         for ev in events {
-            let (actor, target) = match *ev {
-                Event::Rejected { actor, .. } => (Some(actor), None),
-                Event::Interacted { actor, target, .. } | Event::Spoke { actor, target, .. } => {
-                    (Some(actor), Some(target))
+            let (actor, target, invalidate_actor) = match *ev {
+                Event::Rejected { actor, .. } => (Some(actor), None, true),
+                Event::Interacted { actor, target, .. } => {
+                    // Self-targeted maintenance is routine; social/economic
+                    // interactions invalidate the actor's plan.
+                    (Some(actor), Some(target), actor != target)
                 }
-                Event::Moved { .. } => (None, None),
+                Event::Spoke { actor, target, .. } => (Some(actor), Some(target), true),
+                Event::Moved { .. } => (None, None, false),
             };
-            if let Some(actor) = actor {
-                self.invalidate_agent(actor);
+            if invalidate_actor {
+                if let Some(actor) = actor {
+                    self.invalidate_agent(actor);
+                }
             }
-            if let Some(target) = target {
+            if let Some(target) = target.filter(|t| Some(*t) != actor) {
                 self.invalidate_agent(target);
             }
         }
@@ -266,6 +300,7 @@ impl<P: SoulPolicy> HabitSoul<P> {
             for entry in &cache.entries {
                 entry.key.hash(&mut h);
                 format!("{:?}", entry.intent).hash(&mut h);
+                entry.tool.hash(&mut h);
             }
         }
         h.finish()
@@ -280,20 +315,27 @@ impl<P: SoulPolicy> HabitSoul<P> {
         self.cursor = self.cursor.saturating_add(1);
         slot
     }
-
-    fn valid(intent: &Intent, obs: &Observation) -> bool {
-        if obs.tool_mask == 0 {
+    fn valid(intent: &Intent, obs: &Observation, actor: EntityId, tick: u64, created: u64) -> bool {
+        const SOCIAL_MASK: u32 = (1 << 4) | (1 << 5);
+        let ttl = if matches!(intent, Intent::Move { .. }) {
+            8
+        } else {
+            HABIT_TTL
+        };
+        if obs.tool_mask == 0 || tick.saturating_sub(created) >= ttl {
             return false;
         }
         match intent {
-            Intent::Interact { target, .. } | Intent::Speak { target, .. } => obs
-                .neighbors
-                .iter()
-                .any(|n| n.present && n.id == *target && n.dx.abs().max(n.dy.abs()) <= 1),
-            // A move carries only a direction, not a destination. Re-score it
-            // rather than replaying a direction that can strand a character.
-            Intent::Move { .. } => false,
-            Intent::Idle => true,
+            // Local maintenance acts target self; social acts target a neighbor.
+            // Never replay a social intent: opinions can drift between events,
+            // and re-scoring preserves the sociality profile.
+            Intent::Interact { target, .. } => *target == actor,
+            Intent::Speak { .. } => false,
+            // Directional carriers stay bounded to one legal step; exact tool
+            // attribution is retained in the cache entry.
+            Intent::Move { .. } => obs.tool_mask & 1 != 0,
+            // Do not let a cached idle suppress a social opportunity.
+            Intent::Idle => obs.tool_mask & SOCIAL_MASK == 0,
         }
     }
 }
@@ -316,7 +358,6 @@ impl HabitKey {
         }
     }
 }
-
 impl<P: SoulPolicy> SoulPolicy for HabitSoul<P> {
     fn decide(&mut self, obs: &Observation, rng: &mut AgentRng) -> Intent {
         let slot = self.slot_for(obs.tick);
@@ -328,20 +369,25 @@ impl<P: SoulPolicy> SoulPolicy for HabitSoul<P> {
             return Intent::Idle;
         }
         let key = self.context_for(slot, obs);
+        let actor = self.ids[slot];
         let hit = self.caches.get_mut(slot).and_then(|c| {
             c.entries
                 .iter_mut()
-                .find(|e| e.key == key && Self::valid(&e.intent, obs))
+                .find(|e| e.key == key && Self::valid(&e.intent, obs, actor, obs.tick, e.tick))
         });
         if let Some(entry) = hit {
             self.stats.hits += 1;
             self.stats.scoring_calls_skipped += 1;
             self.stamp = self.stamp.wrapping_add(1);
             entry.stamp = self.stamp;
-            if let Some(hook) = self.hit_hook {
-                hook(&mut self.inner, obs, &entry.intent);
+            let intent = entry.intent.clone();
+            let tool = entry.tool;
+            if let (Some(hook), Some(tool)) = (self.tool_hit_hook, tool) {
+                hook(&mut self.inner, obs, &intent, tool);
+            } else if let Some(hook) = self.hit_hook {
+                hook(&mut self.inner, obs, &intent);
             }
-            return entry.intent.clone();
+            return intent;
         }
         if self
             .caches
@@ -352,6 +398,7 @@ impl<P: SoulPolicy> SoulPolicy for HabitSoul<P> {
         }
         self.stats.misses += 1;
         let intent = self.inner.decide(obs, rng);
+        let tool = self.tool_getter.and_then(|getter| getter(&self.inner));
         if let Some(cache) = self.caches.get_mut(slot) {
             self.stamp = self.stamp.wrapping_add(1);
             if cache.entries.len() >= HABIT_CAPACITY {
@@ -367,7 +414,9 @@ impl<P: SoulPolicy> SoulPolicy for HabitSoul<P> {
             cache.entries.push(Entry {
                 key,
                 intent: intent.clone(),
+                tool,
                 stamp: self.stamp,
+                tick: obs.tick,
             });
         }
         intent

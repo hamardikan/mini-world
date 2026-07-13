@@ -51,8 +51,10 @@ pub struct SoakReport {
 }
 
 impl SoakReport {
+    /// Every chosen tool, including cache replays. The UtilitySoul histogram is
+    /// updated on both scorer misses and pack-decoded habit hits.
     pub fn total_actions(&self) -> u64 {
-        self.histogram.iter().sum::<u64>() + self.habit_stats.hits
+        self.histogram.iter().sum()
     }
 
     pub fn ticks_per_sec(&self) -> f64 {
@@ -175,6 +177,15 @@ impl Body for VillageBody {
                 Some(tp) => step_toward(from, tp, true),
                 None => Intent::Idle,
             },
+        }
+    }
+
+    fn tool_for_intent(&self, intent: &Intent) -> Option<u32> {
+        match intent {
+            Intent::Move { .. } => Some(Action::Move.id()),
+            Intent::Speak { .. } => Some(Action::Speak.id()),
+            Intent::Interact { verb, .. } => mw_village::decode(*verb).0.map(Action::id),
+            Intent::Idle => Some(Action::Idle.id()),
         }
     }
 }
@@ -443,10 +454,11 @@ pub fn run_with_habits(cfg: SoakConfig, habits: bool) -> SoakReport {
         positions,
     );
     let mut soul = if habits {
-        ActiveSoul::Habits(HabitSoul::with_hit_hook(
+        ActiveSoul::Habits(HabitSoul::with_hit_hook_and_tool(
             utility,
             ids.clone(),
-            UtilitySoul::<VillageBody>::habit_replay,
+            UtilitySoul::<VillageBody>::habit_replay_tool,
+            UtilitySoul::<VillageBody>::last_tool,
         ))
     } else {
         ActiveSoul::Plain(utility)

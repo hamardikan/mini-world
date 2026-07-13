@@ -105,6 +105,12 @@ pub trait Body {
         self_pos: (i32, i32),
         choice: &Choice,
     ) -> Intent;
+    /// Recover the scenario tool that produced a committed intent. This is used
+    /// only for truthful telemetry when a habit replays an intent without
+    /// running the scorer; packs that do not expose a codec may return `None`.
+    fn tool_for_intent(&self, _intent: &Intent) -> Option<u32> {
+        None
+    }
 }
 
 /// The utility SOUL. Owns per-character persona + memory and a position snapshot
@@ -118,6 +124,8 @@ pub struct UtilitySoul<B: Body> {
     positions: Vec<(i32, i32)>,
     memories: Vec<Memory>,
     hist: [u64; TOOL_SLOTS],
+    /// Last scorer-selected tool, consumed by HabitSoul when it stores a plan.
+    last_tool: Option<u32>,
     // Per-tick call resolution: the kernel calls `decide` once per entity in
     // stable index order, so a counter reset on each new tick recovers which
     // entity is deciding without the kernel observation carrying an id.
@@ -148,6 +156,7 @@ impl<B: Body> UtilitySoul<B> {
             positions,
             memories,
             hist: [0; TOOL_SLOTS],
+            last_tool: None,
             last_tick: None,
             cursor: 0,
         }
@@ -172,9 +181,27 @@ impl<B: Body> UtilitySoul<B> {
         self.cursor += 1;
     }
 
+    pub fn last_tool(&self) -> Option<u32> {
+        self.last_tool
+    }
+
     /// Advance the cursor for a replayed action without running observe/score.
-    pub fn habit_replay(&mut self, obs: &Observation, _intent: &Intent) {
+    pub fn habit_replay(&mut self, obs: &Observation, intent: &Intent) {
         self.habit_skip(obs);
+        if let Some(tool) = self.body.tool_for_intent(intent) {
+            self.record_tool(tool);
+        }
+    }
+
+    pub fn habit_replay_tool(&mut self, obs: &Observation, _intent: &Intent, tool: u32) {
+        self.habit_skip(obs);
+        self.record_tool(tool);
+    }
+
+    fn record_tool(&mut self, tool: u32) {
+        if let Some(count) = self.hist.get_mut(tool as usize) {
+            *count += 1;
+        }
     }
 
     /// Feed the tick's new events into memory, routed to the involved parties.
@@ -384,6 +411,7 @@ impl<B: Body> SoulPolicy for UtilitySoul<B> {
         let agent_obs = obs::encode(obs.tick, self_stats, cands, events, obs.tool_mask);
 
         let choice = self.score(&agent_obs, &persona, rng);
+        self.last_tool = Some(choice.tool);
         self.hist[choice.tool as usize] += 1;
         self.body.to_intent(entity, obs.tick, self_pos, &choice)
     }

@@ -33,6 +33,16 @@ pub const SPEAK_GAIN: i32 = 300;
 pub const USE_ENERGY_GAIN: i32 = 150;
 /// Working burns energy; `work` is gated on having energy to spend.
 pub const WORK_ENERGY_COST: i32 = 60;
+/// Pack-owned maintenance calibration consumed by the cold analytic path.
+/// Keeping these beside the live gains prevents fast-forward drift when a
+/// scenario tuning changes.
+pub const NEED_DECAY: [i64; 3] = [
+    HUNGER_DECAY as i64,
+    ENERGY_DECAY as i64,
+    SOCIAL_DECAY as i64,
+];
+pub const MAINTENANCE_GAIN: [i64; 3] = [EAT_GAIN as i64, SLEEP_GAIN as i64, SPEAK_GAIN as i64];
+pub const MAINTENANCE_CYCLE: [u64; 3] = [160, 360, 100];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Needs {

@@ -26,7 +26,10 @@ use mw_core::{
 
 pub use action::{decode, verb, Action, Item, ITEM_COUNT, TOOL_COUNT};
 pub use map::{adjacent, tile_at, Tile, GRID};
-pub use needs::{Needs, MAX_NEED, STARVE_TICKS};
+pub use needs::{
+    Needs, EAT_GAIN, ENERGY_DECAY, HUNGER_DECAY, MAINTENANCE_CYCLE, MAINTENANCE_GAIN, MAX_NEED,
+    NEED_DECAY, SLEEP_GAIN, SOCIAL_DECAY, SPEAK_GAIN, STARVE_TICKS,
+};
 
 /// Per-pack mutable state. Entity-indexed vectors grow lazily; the world never
 /// tells the pack about spawns, but slot indices are stable so first touch of
