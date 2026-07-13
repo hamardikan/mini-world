@@ -1,0 +1,24 @@
+# Workspace root. mw-core is the deterministic kernel (full impl); mw-village,
+# mw-agents, mw-text are compile-clean contract skeletons filled in later steps;
+# mw-sim is the headless functional check.
+[workspace]
+resolver = "2"
+members = [
+    "crates/mw-core",
+    "crates/mw-village",
+    "crates/mw-agents",
+    "crates/mw-text",
+    "crates/mw-sim",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.0"
+publish = false
+
+[workspace.dependencies]
+mw-core = { path = "crates/mw-core" }
+# PCG is a small, well-specified PRNG: identical output on every platform, so it
+# is safe inside the determinism-critical sim path.
+rand_pcg = "0.3"
+rand_core = "0.6"

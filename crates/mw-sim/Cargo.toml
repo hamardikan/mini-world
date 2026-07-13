@@ -1,0 +1,13 @@
+[package]
+name = "mw-sim"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mw-sim"
+path = "src/main.rs"
+
+[dependencies]
+mw-core.workspace = true
+clap = { version = "4", features = ["derive"] }
