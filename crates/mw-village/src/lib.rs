@@ -19,7 +19,10 @@ mod needs;
 
 use std::cell::RefCell;
 
-use mw_core::{ActionManifest, EntityId, Intent, RejectReason, ScenarioPack, StatRegistry, World};
+use mw_core::{
+    ActionManifest, EntityId, FnvHasher, Intent, Observation, RejectReason, ScenarioPack,
+    StatRegistry, World,
+};
 
 pub use action::{decode, verb, Action, Item, ITEM_COUNT, TOOL_COUNT};
 pub use map::{adjacent, tile_at, Tile, GRID};
@@ -98,8 +101,9 @@ impl VillagePack {
     /// [`Action`] with id `i`). This is the mask that belongs in
     /// [`mw_core::Observation::tool_mask`]; the kernel's placeholder mask is
     /// overridden here once a pack is installed. `validate` rejects exactly the
-    /// intents this mask omits, so the two stay in lockstep.
-    pub fn afforded_tools(&self, world: &World, entity: EntityId) -> u32 {
+    /// intents this mask omits, so the two stay in lockstep. Neighbor proximity
+    /// is read from the caller's `obs`, so no second K-nearest scan is done.
+    pub fn afforded_tools(&self, world: &World, entity: EntityId, obs: &Observation) -> u32 {
         let Some(e) = world.entity(entity) else {
             return 0;
         };
@@ -120,8 +124,7 @@ impl VillagePack {
         let has_item = inv.iter().any(|&c| c > 0);
         let ground_item = ground.iter().any(|&c| c > 0);
 
-        // Neighbor proximity from the kernel's own K-nearest observation.
-        let obs = world.observe(entity);
+        // Neighbor proximity from the single observation the kernel already built.
         let mut any_neighbor = false;
         let mut adjacent_neighbor = false;
         for slot in obs.neighbors.iter().filter(|s| s.present) {
@@ -306,8 +309,39 @@ impl ScenarioPack for VillagePack {
     // The seam: route the kernel's affordance query to this pack's body-state
     // mask. Delegates to the inherent method so direct callers (tests, UI) keep
     // working unchanged.
-    fn afforded_tools(&self, world: &World, entity: EntityId) -> u32 {
-        VillagePack::afforded_tools(self, world, entity)
+    fn afforded_tools(&self, world: &World, entity: EntityId, obs: &Observation) -> u32 {
+        VillagePack::afforded_tools(self, world, entity, obs)
+    }
+
+    /// Fold every character's needs, inventory, and each cell's ground items into
+    /// the canonical hash, in entity-id / cell order (integer only). Including
+    /// `Needs::starving_since` means the death clock is part of the hash, so
+    /// replay must reproduce it too.
+    fn hash_state(&self, h: &mut FnvHasher) {
+        let st = self.state.borrow();
+        for n in st.needs.iter() {
+            n.hash_into(h);
+        }
+        for inv in st.inv.iter() {
+            for &c in inv.iter() {
+                h.write_u32(c as u32);
+            }
+        }
+        for cell in st.ground.iter() {
+            for &c in cell.iter() {
+                h.write_u32(c as u32);
+            }
+        }
+    }
+
+    /// Cold analytic advance: cold agents do not move, so a fast-forward is just
+    /// closed-form need decay realized to `to_tick` for every character. Pure in
+    /// `(from, to)` and idempotent under replay.
+    fn fast_forward(&self, _world: &mut World, _from_tick: u64, to_tick: u64) {
+        let mut st = self.state.borrow_mut();
+        for n in st.needs.iter_mut() {
+            n.settle(to_tick);
+        }
     }
 }
 
@@ -421,6 +455,12 @@ mod tests {
         mask & (1 << a.id()) != 0
     }
 
+    /// The affordance mask, built the way the kernel does: one observation, then
+    /// the mask off it.
+    fn mask_for(pack: &VillagePack, world: &World, e: EntityId) -> u32 {
+        pack.afforded_tools(world, e, &world.observe(e))
+    }
+
     #[test]
     fn manifest_lists_twelve_dense_tools() {
         let m = action::manifest();
@@ -450,7 +490,7 @@ mod tests {
         let pack = VillagePack::new();
         let mut world = World::with_pack(1, &pack);
         let e = world.spawn((3, 6));
-        let mask = pack.afforded_tools(&world, e);
+        let mask = mask_for(&pack, &world, e);
         assert_eq!(mask, (1 << Action::Move.id()) | (1 << Action::Idle.id()));
         for a in [
             Action::Eat,
@@ -478,17 +518,17 @@ mod tests {
         let sleeper = world.spawn((0, 0)); // Home
         let farmer = world.spawn((13, 13)); // Field
 
-        let bm = pack.afforded_tools(&world, baker);
+        let bm = mask_for(&pack, &world, baker);
         assert!(afforded(bm, Action::Eat)); // free food at the bakery
         assert!(afforded(bm, Action::Work));
         assert!(!afforded(bm, Action::Sleep));
 
-        let sm = pack.afforded_tools(&world, sleeper);
+        let sm = mask_for(&pack, &world, sleeper);
         assert!(afforded(sm, Action::Sleep));
         assert!(!afforded(sm, Action::Work));
         assert!(!afforded(sm, Action::Eat));
 
-        let fm = pack.afforded_tools(&world, farmer);
+        let fm = mask_for(&pack, &world, farmer);
         assert!(afforded(fm, Action::Work));
         assert!(!afforded(fm, Action::Eat));
     }
@@ -499,7 +539,7 @@ mod tests {
         let mut world = World::with_pack(1, &pack);
         let a = world.spawn((5, 5));
         let _b = world.spawn((6, 5)); // adjacent to a
-        let mask = pack.afforded_tools(&world, a);
+        let mask = mask_for(&pack, &world, a);
         assert!(afforded(mask, Action::Speak));
         assert!(afforded(mask, Action::Follow));
         assert!(afforded(mask, Action::Flee));

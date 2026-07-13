@@ -2,9 +2,14 @@
 //!
 //! Every draw is derived from `(world_seed, entity_id, stream_tag, tick)`, so an
 //! entity's randomness depends only on *its own* identity and the current tick —
-//! never on how many other entities were processed first. This is what lets the
-//! kernel process entities in any order within a tick and still produce a bitwise
-//! identical world: there is no shared sequential stream to desync.
+//! never on how many other entities were processed first. That makes an entity's
+//! *draws* order-free.
+//!
+//! Reorder independence is NOT claimed for shared-cell *effects* (Give/Pickup/
+//! Drop, where two actors race for the same tile): those genuinely depend on who
+//! resolves first. The kernel therefore ratifies a **canonical apply order** —
+//! `World::apply_intents` sorts each tick's batch by entity id before executing —
+//! so the outcome is deterministic regardless of submission order.
 
 use crate::entity::EntityId;
 use crate::hash::{splitmix64, FnvHasher};

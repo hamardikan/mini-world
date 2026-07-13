@@ -6,6 +6,7 @@
 //! the shapes fixed, not the implementations.
 
 use crate::entity::{EntityId, StatRegistry};
+use crate::hash::FnvHasher;
 use crate::intent::{Intent, RejectReason};
 use crate::rng::AgentRng;
 use crate::world::World;
@@ -67,11 +68,11 @@ pub trait ScenarioPack {
     fn register(&self, registry: &mut StatRegistry);
 
     /// Bitmask of tools `entity`'s body currently affords (bit `i` = tool id
-    /// `i`). The kernel calls this when building an [`Observation`] so a brain
-    /// only ever sees the legal subset — this is the seam that lets the pack
-    /// drive affordance masking instead of the kernel hardcoding it. Default:
+    /// `i`). The kernel builds one [`Observation`] per decide and passes it in,
+    /// so the pack reads neighbor proximity from `obs` instead of re-observing —
+    /// the mask and the observation are computed from a single scan. Default:
     /// the whole manifest is afforded; packs override per body state.
-    fn afforded_tools(&self, _world: &World, _entity: EntityId) -> u32 {
+    fn afforded_tools(&self, _world: &World, _entity: EntityId, _obs: &Observation) -> u32 {
         let n = self.manifest().tools.len();
         if n >= 32 {
             u32::MAX
@@ -79,6 +80,19 @@ pub trait ScenarioPack {
             (1u32 << n) - 1
         }
     }
+
+    /// Fold this pack's per-entity state into the world's canonical hash, in
+    /// canonical (entity-id / cell) order. The kernel hashes only positions and
+    /// the tick; a pack owns the rest (needs, inventories, ground items), so
+    /// without this seam replay verification would miss it. Default: no-op (a
+    /// stateless pack contributes nothing).
+    fn hash_state(&self, _h: &mut FnvHasher) {}
+
+    /// Advance this pack's per-entity state analytically from `from_tick` to
+    /// `to_tick` (the cold LOD ring / AFK fast-forward): no per-tick intents,
+    /// just closed-form need integration. Must be a pure function of
+    /// `(seed, from, to)` so replay reproduces it exactly. Default: no-op.
+    fn fast_forward(&self, _world: &mut World, _from_tick: u64, _to_tick: u64) {}
 }
 
 /// A character's brain. Given a fixed-shape observation and its own RNG stream,

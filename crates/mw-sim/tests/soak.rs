@@ -3,6 +3,7 @@
 //! paralysis), and produce a non-degenerate action mix.
 
 use mw_sim::soak::{self, SoakConfig};
+use mw_village::MAX_NEED;
 
 const CFG: SoakConfig = SoakConfig {
     seed: 1,
@@ -34,13 +35,29 @@ fn soak_hash_is_seed_sensitive() {
 #[test]
 fn soak_has_no_paralysis_or_starvation_deadlock() {
     let r = soak::run(CFG);
-    // Every living agent decides every tick; zero deaths means the whole
-    // population stayed functional — no all-idle paralysis, no deadlock.
-    assert_eq!(r.deaths, 0, "the village must not starve to death");
-    assert_eq!(
+    // Starvation death is now *reachable* (before the needs fix, settle() reset
+    // the clock so no agent could ever die). A few stragglers who fail to reach
+    // food in time may starve, but the village must not collapse: the vast
+    // majority live and stay well-fed (mean hunger high, not decayed to zero).
+    let survivors = CFG.agents as usize - r.deaths;
+    assert!(
+        survivors as i32 >= CFG.agents * 4 / 5,
+        "mass starvation, only {survivors}/{} survived",
+        CFG.agents
+    );
+    assert!(
+        r.mean_needs()[0] > (MAX_NEED / 2) as f64,
+        "the living village is not feeding itself (mean hunger {:.0})",
+        r.mean_needs()[0]
+    );
+    // No all-idle paralysis: every surviving agent acts every tick, so the count
+    // is at least one action per survivor per tick (the dead add their pre-death
+    // actions on top).
+    assert!(
+        r.total_actions() >= survivors as u64 * CFG.ticks,
+        "population went idle: {} actions for {survivors} survivors over {} ticks",
         r.total_actions(),
-        CFG.ticks * CFG.agents as u64,
-        "every agent must act every tick (no paralysis)"
+        CFG.ticks
     );
 }
 

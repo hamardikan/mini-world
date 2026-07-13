@@ -7,6 +7,8 @@
 //! per-tick sweep, no wall-clock, order-independent because each entity's
 //! projection depends only on its own stored state and the tick.
 
+use mw_core::FnvHasher;
+
 /// Fixed-point ceiling for every need (0 = fully depleted, `MAX_NEED` = sated).
 pub const MAX_NEED: i32 = 1000;
 
@@ -36,6 +38,11 @@ pub struct Needs {
     social: i32,
     /// Tick the stored values are current as of.
     settled: u64,
+    /// First tick hunger reached zero, latched persistently. Once set it is NOT
+    /// cleared by continued settling at zero — only by eating back above zero —
+    /// so the death clock keeps running for an agent that idles/moves at zero
+    /// hunger instead of being reset on every act.
+    starving_since: Option<u64>,
 }
 
 fn decay(stored: i32, rate: i32, elapsed: u64) -> i32 {
@@ -56,6 +63,7 @@ impl Needs {
             energy: MAX_NEED,
             social: MAX_NEED,
             settled: 0,
+            starving_since: None,
         }
     }
 
@@ -77,19 +85,29 @@ impl Needs {
         self.project(tick).1
     }
 
-    /// Dead once hunger has sat at zero for `STARVE_TICKS`. Derived purely from
-    /// stored state so a starved entity that never acts again stays dead: it
-    /// reaches zero at `settled + ceil(hunger / rate)` and dies `STARVE_TICKS`
-    /// later.
+    /// Dead once hunger has sat at zero for `STARVE_TICKS`. The zero-crossing is
+    /// latched in `starving_since` on the first settle at zero, so an agent that
+    /// keeps idling/moving at zero hunger still dies on schedule (the latch is
+    /// not reset by continued action). An entity that never acts again is caught
+    /// by projecting its stored slope to the first-zero tick.
     pub fn dead(&self, tick: u64) -> bool {
-        let zero_tick = self.settled + div_ceil(self.hunger, HUNGER_DECAY);
+        let zero_tick = self
+            .starving_since
+            .unwrap_or_else(|| self.settled + div_ceil(self.hunger, HUNGER_DECAY));
         tick >= zero_tick + STARVE_TICKS
     }
 
     /// Realize decay up to `tick` into the stored values. Call before applying
-    /// a restore so the gain lands on the current (decayed) level.
+    /// a restore so the gain lands on the current (decayed) level. Latches
+    /// `starving_since` the first time hunger reaches zero and never clears it
+    /// here — that is what makes the death clock survive continued activity.
     pub fn settle(&mut self, tick: u64) {
         let (h, en, so) = self.project(tick);
+        if h == 0 && self.starving_since.is_none() {
+            // The true first-zero tick from the pre-settle slope, so the latched
+            // value matches what `dead` would have projected before settling.
+            self.starving_since = Some(self.settled + div_ceil(self.hunger, HUNGER_DECAY));
+        }
         self.hunger = h;
         self.energy = en;
         self.social = so;
@@ -103,6 +121,22 @@ impl Needs {
         self.hunger = (self.hunger + hunger).clamp(0, MAX_NEED);
         self.energy = (self.energy + energy).clamp(0, MAX_NEED);
         self.social = (self.social + social).clamp(0, MAX_NEED);
+        // Eating back above zero clears the starvation latch.
+        if self.hunger > 0 {
+            self.starving_since = None;
+        }
+    }
+
+    /// Fold the full stored state into the canonical hash — including
+    /// `starving_since`, so a replayed run reproduces the death clock exactly.
+    pub fn hash_into(&self, h: &mut FnvHasher) {
+        h.write_i32(self.hunger);
+        h.write_i32(self.energy);
+        h.write_i32(self.social);
+        h.write_u64(self.settled);
+        // Encode Option<u64> as a present-flag plus value (no float, fixed width).
+        h.write_u64(self.starving_since.is_some() as u64);
+        h.write_u64(self.starving_since.unwrap_or(0));
     }
 }
 
@@ -141,5 +175,32 @@ mod tests {
         let mut fed = Needs::full();
         fed.adjust(400, EAT_GAIN, 0, 0);
         assert!(!fed.dead(400));
+    }
+
+    #[test]
+    fn acting_at_zero_hunger_still_starves() {
+        // The bug: settle() clamped hunger to 0 and reset the death clock, so an
+        // agent that kept idling/moving never crossed the starvation threshold.
+        // Now the zero-crossing is latched, so activity cannot cheat death.
+        let mut n = Needs::full(); // hunger reaches 0 at tick 500
+        for t in 500..(500 + STARVE_TICKS) {
+            // Alternate idle (settle) and a "move" (also settle) every tick.
+            n.settle(t);
+            assert!(!n.dead(t), "must not die before the starve window elapses");
+        }
+        n.settle(500 + STARVE_TICKS);
+        assert!(
+            n.dead(500 + STARVE_TICKS),
+            "dies exactly STARVE_TICKS after hunger first hit zero, despite acting"
+        );
+    }
+
+    #[test]
+    fn eating_above_zero_clears_the_starvation_latch() {
+        let mut n = Needs::full();
+        n.settle(500); // latch starving_since = 500
+        assert!(n.dead(600));
+        n.adjust(560, EAT_GAIN, 0, 0); // eat back above zero, clearing the latch
+        assert!(!n.dead(600), "eating resets the death clock");
     }
 }

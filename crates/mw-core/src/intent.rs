@@ -35,6 +35,24 @@ pub struct LoggedIntent {
     pub intent: Intent,
 }
 
+/// An analytic fast-forward span: the cold LOD ring advanced the world from
+/// `start_tick` by `duration` ticks without per-tick intents. Recorded in the
+/// kernel log so a cold FF is reconstructible from `(seed, log)` alone —
+/// replay re-applies the same closed-form advance instead of re-running it.
+#[derive(Clone, Copy, Debug)]
+pub struct FfSegment {
+    pub start_tick: u64,
+    pub duration: u64,
+}
+
+/// One entry in the kernel's ground-truth log: either a validated intent or an
+/// analytic fast-forward segment. Replay walks these in order.
+#[derive(Clone, Debug)]
+pub enum LogEntry {
+    Intent(LoggedIntent),
+    Ff(FfSegment),
+}
+
 /// Outcomes emitted by the executor. The event log is the outcome ground truth
 /// (memory, digests, and dialogue rendering are downstream consumers).
 #[derive(Clone, Debug)]

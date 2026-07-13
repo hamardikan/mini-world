@@ -6,9 +6,12 @@
 //! deaths, and a final state hash.
 
 use clap::{Parser, Subcommand};
+use mw_agents::dialogue::{DialogueRenderer, FocusPoint, MockRenderer};
 use mw_core::{AgentRng, Intent, KernelPack, Observation, SoulPolicy, World};
+use mw_sim::dialogue::{demo, LlamaDialogue, Scene};
 use mw_sim::director::{self, FfConfig, TICKS_PER_DAY};
 use mw_sim::soak::{self, SoakConfig};
+use mw_text::{Config, LlamaServerBackend};
 
 #[derive(Parser)]
 #[command(about = "mini-world headless kernel runner")]
@@ -60,6 +63,13 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
+    /// Latent-dialogue demo: script the canonical scene, render the observed
+    /// conversation, then backfill one latent conversation on demand. Uses the
+    /// offline mock unless `MW_TEXT_LIVE=1` selects the real TEXT backend.
+    Dialogue {
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
 }
 
 /// Picks one of four unit steps from the entity's own RNG stream. It ignores the
@@ -97,7 +107,7 @@ fn run_kernel(ticks: u64, entities: i32, seed: u64) {
         seed,
         world.entity_count(),
         world.tick(),
-        world.state_hash(),
+        world.state_hash(&pack),
     );
 }
 
@@ -180,6 +190,38 @@ fn run_view(smoke: bool, agents: i32, seed: u64) {
     }
 }
 
+/// Latent-dialogue demo: render the observed conversation, then backfill one
+/// latent conversation on demand (DESIGN §4). Mock backend unless MW_TEXT_LIVE=1.
+fn run_dialogue(seed: u64) {
+    let (positions, scripts, focus) = demo();
+    let mut scene = Scene::script(seed, &positions, &scripts);
+    println!(
+        "latent-dialogue demo: {} committed conversations",
+        scene.log.len()
+    );
+    let live = std::env::var("MW_TEXT_LIVE").as_deref() == Ok("1");
+    if live {
+        match LlamaServerBackend::spawn(Config::default()) {
+            Ok(b) => return play(&mut scene, &focus, &LlamaDialogue { backend: &b }),
+            Err(e) => eprintln!("live TEXT backend unavailable ({e}); using mock"),
+        }
+    }
+    play(&mut scene, &focus, &MockRenderer::new());
+}
+
+/// Render observed then backfill one latent conversation, printing both.
+fn play<R: DialogueRenderer>(scene: &mut Scene, focus: &FocusPoint, r: &R) {
+    let rendered = scene.render_observed(focus, r);
+    println!("rendered {rendered} observed conversation(s) at focus");
+    match (0..scene.log.len()).find(|&i| !scene.is_observed(i, focus)) {
+        Some(i) => println!(
+            "backfilled latent conversation #{i}: {}",
+            scene.backfill(i, r)
+        ),
+        None => println!("no latent conversation to backfill"),
+    }
+}
+
 fn main() {
     match Args::parse().cmd {
         Command::Run {
@@ -198,5 +240,6 @@ fn main() {
             agents,
             seed,
         } => run_view(smoke, agents, seed),
+        Command::Dialogue { seed } => run_dialogue(seed),
     }
 }

@@ -38,7 +38,8 @@ fn run(seed: u64) -> World {
 
 #[test]
 fn determinism_same_seed() {
-    assert_eq!(run(42).state_hash(), run(42).state_hash());
+    let pack = KernelPack::new();
+    assert_eq!(run(42).state_hash(&pack), run(42).state_hash(&pack));
 }
 
 #[test]
@@ -46,10 +47,11 @@ fn replay_reproduces_hash() {
     let original = run(42);
     let pack = KernelPack::new();
     let replayed = World::replay(42, &start_positions(), TICKS, original.intent_log(), &pack);
-    assert_eq!(original.state_hash(), replayed.state_hash());
+    assert_eq!(original.state_hash(&pack), replayed.state_hash(&pack));
 }
 
 #[test]
 fn seed_divergence_changes_hash() {
-    assert_ne!(run(42).state_hash(), run(43).state_hash());
+    let pack = KernelPack::new();
+    assert_ne!(run(42).state_hash(&pack), run(43).state_hash(&pack));
 }

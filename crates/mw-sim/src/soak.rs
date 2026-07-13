@@ -337,27 +337,10 @@ pub fn verb_affect() -> Vec<(u32, i32)> {
     ]
 }
 
-/// FNV-1a fold — a stable, architecture-independent hash mix.
-fn fold(mut h: u64, x: u64) -> u64 {
-    h ^= x;
-    h.wrapping_mul(0x0000_0100_0000_01b3)
-}
-
-/// Canonical final hash: kernel positions plus each character's needs and alive
-/// flag, so the digest reflects the social/economic state the kernel hash alone
-/// (positions only) cannot see. Iterates in slot order — no map iteration.
-fn hash_state(world: &World, pack: &VillagePack, ids: &[EntityId]) -> u64 {
-    let tick = world.tick();
-    let mut h = fold(0xcbf2_9ce4_8422_2325, world.state_hash());
-    for &id in ids {
-        let (hu, en, so) = pack.needs(id).project(tick);
-        h = fold(h, hu as u64);
-        h = fold(h, en as u64);
-        h = fold(h, so as u64);
-        h = fold(h, pack.is_dead(world, id) as u64);
-    }
-    h
-}
+// The soak's final hash is now the kernel's full canonical hash: it folds the
+// village pack's own per-entity state (needs incl. the starvation clock,
+// inventories, ground items) via `ScenarioPack::hash_state`, so positions and
+// the social/economic state are covered by one hash that replay must reproduce.
 
 /// Run the soak and return its report.
 pub fn run(cfg: SoakConfig) -> SoakReport {
@@ -407,7 +390,7 @@ pub fn run(cfg: SoakConfig) -> SoakReport {
     let elapsed_secs = t0.elapsed().as_secs_f64();
 
     let deaths = ids.iter().filter(|&&id| pack.is_dead(&world, id)).count();
-    let final_hash = hash_state(&world, &pack, &ids);
+    let final_hash = world.state_hash(&*pack);
     SoakReport {
         cfg,
         histogram: *soul.histogram(),

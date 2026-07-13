@@ -12,7 +12,7 @@ use mw_agents::dialogue::{
 };
 use mw_agents::memory::Memory;
 use mw_agents::persona::Persona;
-use mw_core::{EntityId, Intent, LoggedIntent, World};
+use mw_core::{EntityId, Intent, LogEntry, LoggedIntent, World};
 use mw_text::{LlamaServerBackend, PromptSpec};
 
 /// Adapts the real [`LlamaServerBackend`] to the [`DialogueRenderer`] seam:
@@ -77,16 +77,18 @@ impl Scene {
         let ids: Vec<EntityId> = positions.iter().map(|&p| scratch.spawn(p)).collect();
 
         let last_tick = scripts.iter().map(|s| s.tick).max().unwrap_or(0);
-        let intent_log: Vec<LoggedIntent> = scripts
+        let intent_log: Vec<LogEntry> = scripts
             .iter()
-            .map(|s| LoggedIntent {
-                tick: s.tick,
-                actor: ids[s.speaker],
-                intent: Intent::Speak {
-                    target: ids[s.listener],
-                    act: s.act,
-                    topic: s.topic,
-                },
+            .map(|s| {
+                LogEntry::Intent(LoggedIntent {
+                    tick: s.tick,
+                    actor: ids[s.speaker],
+                    intent: Intent::Speak {
+                        target: ids[s.listener],
+                        act: s.act,
+                        topic: s.topic,
+                    },
+                })
             })
             .collect();
 

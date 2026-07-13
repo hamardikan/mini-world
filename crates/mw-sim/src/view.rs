@@ -186,7 +186,14 @@ impl App {
     /// render any conversation the focus now observes (attention-gating).
     fn step(&mut self) {
         self.soul.snapshot(&self.world);
-        self.world.step(&*self.pack, &mut self.soul);
+        // LOD gate: only hot (every tick) and warm (on cadence) entities run
+        // SOUL; cold entities idle-extrapolate. The director's rings were set by
+        // the previous tick's update, so they gate this tick's decisions.
+        let director = &self.director;
+        self.world
+            .step_gated(&*self.pack, &mut self.soul, |id, tick| {
+                director.should_run_soul(id.index() as usize, tick)
+            });
         let end = self.world.event_log().len();
         // Clone the tick's new events out so the borrow of the world ends before
         // we touch other fields.

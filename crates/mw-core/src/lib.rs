@@ -19,7 +19,8 @@ pub use contracts::{
     SpeakRequest, TextBackend, ToolDescriptor, K_NEAREST,
 };
 pub use entity::{Entity, EntityId, StatRegistry};
-pub use intent::{Event, Intent, LoggedIntent, RejectReason};
+pub use hash::FnvHasher;
+pub use intent::{Event, FfSegment, Intent, LogEntry, LoggedIntent, RejectReason};
 pub use pack::KernelPack;
 pub use rng::{agent_rng, stream, AgentRng, StreamTag};
 pub use world::World;

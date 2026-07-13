@@ -3,9 +3,7 @@
 //! that valid intents apply, invalid ones are rejected with the right
 //! `RejectReason`, and the run replays bit-identically.
 
-use mw_core::{
-    AgentRng, Event, Intent, LoggedIntent, Observation, RejectReason, SoulPolicy, World,
-};
+use mw_core::{AgentRng, Event, Intent, LogEntry, Observation, RejectReason, SoulPolicy, World};
 use mw_village::{verb, Action, Item, VillagePack, MAX_NEED};
 
 const TICKS: u64 = 1000;
@@ -155,12 +153,19 @@ fn scripted_run_validates_and_applies_over_1k_ticks() {
     let logged_moves = world
         .intent_log()
         .iter()
+        .filter_map(|e| match e {
+            LogEntry::Intent(l) => Some(l),
+            LogEntry::Ff(_) => None,
+        })
         .filter(|l| l.actor == ids[6] && matches!(l.intent, Intent::Move { .. }))
         .count();
     assert_eq!(logged_moves, 10, "5->15 is ten single steps, rest rejected");
 
     // The glitch actor's unknown intents never enter the ground-truth log.
-    assert!(!world.intent_log().iter().any(|l| l.actor == ids[5]));
+    assert!(!world.intent_log().iter().any(|e| matches!(
+        e,
+        LogEntry::Intent(l) if l.actor == ids[5]
+    )));
 }
 
 #[test]
@@ -171,12 +176,56 @@ fn run_is_deterministic_and_replayable() {
     // Same seed + script → identical canonical hash.
     let (mut b, pack_b, ids_b) = build_world();
     run(&mut b, &pack_b, &ids_b);
-    assert_eq!(a.state_hash(), b.state_hash());
+    assert_eq!(a.state_hash(&pack_a), b.state_hash(&pack_b));
 
     // Replaying the validated-intent log on a fresh pack reproduces the hash
     // without re-running any policy.
-    let log: Vec<LoggedIntent> = a.intent_log().to_vec();
+    let log: Vec<LogEntry> = a.intent_log().to_vec();
     let pack_r = VillagePack::new();
     let replayed = World::replay(a.seed(), &positions(), TICKS, &log, &pack_r);
-    assert_eq!(a.state_hash(), replayed.state_hash());
+    assert_eq!(a.state_hash(&pack_a), replayed.state_hash(&pack_r));
+}
+
+/// Everyone idles; needs simply decay. Exercises the fast-forward replay path
+/// without depending on the utility SOUL (which lives in mw-sim).
+struct AllIdle;
+impl SoulPolicy for AllIdle {
+    fn decide(&mut self, _obs: &Observation, _rng: &mut AgentRng) -> Intent {
+        Intent::Idle
+    }
+}
+
+#[test]
+fn cold_fast_forward_is_reconstructible_from_the_log() {
+    // A week of AFK cold time, bracketed by live ticks. Because the fast-forward
+    // is recorded as an `FfSegment`, replaying `(seed, log)` reproduces the exact
+    // full state hash — needs, starvation clock, inventories and all — without
+    // re-running the analytic advance from scratch.
+    const WEEK: u64 = 7 * 86_400;
+    let (mut w, pack, _ids) = build_world();
+    let mut policy = AllIdle;
+    for _ in 0..50 {
+        w.step(&pack, &mut policy); // live
+    }
+    w.fast_forward(&pack, WEEK); // cold AFK span
+    for _ in 0..50 {
+        w.step(&pack, &mut policy); // live again
+    }
+
+    let total = w.tick();
+    assert_eq!(total, 100 + WEEK);
+    let hash = w.state_hash(&pack);
+    let log: Vec<LogEntry> = w.intent_log().to_vec();
+    assert!(
+        log.iter().any(|e| matches!(e, LogEntry::Ff(_))),
+        "the fast-forward must be recorded in the log"
+    );
+
+    let pack_r = VillagePack::new();
+    let replayed = World::replay(w.seed(), &positions(), total, &log, &pack_r);
+    assert_eq!(
+        hash,
+        replayed.state_hash(&pack_r),
+        "replay reproduces the FF span"
+    );
 }
