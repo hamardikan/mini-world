@@ -19,7 +19,8 @@ Targets consumer laptops and phones (GPU or CPU). No cloud dependency for core p
 
 The world kernel validates and executes every intent. Consequences:
 
-- **Determinism & replay.** Cross-device bitwise NN equality is unachievable (thread scheduling, backend kernels, quantization differences). Therefore the **validated-intent log is the ground truth**: record sim seed + model hash + backend ID + chosen intents. Replay, AFK fast-forward, and any multiplayer verification replay *intents* — they never re-run float inference. NN output is always advisory.
+- **Determinism & replay.** Cross-device bitwise NN equality is unachievable (thread scheduling, backend kernels, quantization differences). Therefore the **validated-intent log is the ground truth**: record sim seed + model hash + backend ID + chosen intents and analytic fast-forward segments. Replay and multiplayer verification replay intents; AFK fast-forward consumes each `FfSegment` analytically. NN output is always advisory.
+- **Canonical application order.** `World::apply_intents` sorts each tick's batch by entity id (`index`, then `generation`) before validation, execution, and logging. Per-entity RNG draws are keyed by `(seed, entity, stream, tick)`, so a character's draws do not depend on iteration order; conflicting effects are resolved by the canonical entity-id apply order rather than by submission order.
 - **Swappable brains.** Utility-AI stub today, distilled net tomorrow, cloud LLM for hero characters — same socket.
 - **Scenario rules are uncheatable.** The kernel rejects invalid calls (range, cooldowns, resources) regardless of what the brain proposes.
 
@@ -78,13 +79,13 @@ flowchart LR
 ```
 
 ### 1. World Kernel
-Deterministic, fixed-timestep, tick-based, ECS-style. Seeded RNG, no wall-clock. Owns all truth: entities, positions, stats, relationships, inventory. Validates and executes intents. Determinism is what makes AFK progression (= fast-forwarding the sim) and replay (= debugging + training-data generation) possible.
+Deterministic, fixed-timestep, tick-based, ECS-style. Seeded RNG, no wall-clock. Owns all truth: entities, positions, stats, relationships, inventory. Validates and executes intents. The canonical hash also folds pack-owned state through `ScenarioPack::hash_state`; this is what makes AFK progression (= fast-forwarding the sim) and replay (= debugging + training-data generation) verifiable.
 
 ### 2. Action Manifest (the digital body)
 Per-scenario typed tool schemas with affordance masking. See load-bearing decision 3.
 
 ### 3. Observation Encoder
-Fixed-size structured observation per character: self stats, K-nearest entities with relation scores, active events, memory summary, current goal, afforded-tool mask. **This schema is the versioned API between game and brain** — SOUL can be retrained without touching the sim.
+The ratified rich observation schema is `mw_agents::obs::AgentObs`: fixed-size self needs, eight nearest enriched neighbors, event buckets, goal, and afforded-tool mask. The kernel's `mw_core::Observation` is the minimal seam — tick, position, nearest slots, event count, and tool mask — used for one kernel scan and affordance masking. `World::observe_for_policy` constructs that minimal observation once, then passes it to `ScenarioPack::afforded_tools`; the pack fills the mask without a second neighbor scan. The SOUL-facing `AgentObs` can therefore evolve without changing the kernel seam.
 
 ### 4. Habit Cache *(added from research)*
 Sits between observation and SOUL. Caches decisions as **plan→actions + explicit validity predicates**; replays while predicates hold, invokes SOUL only on novel/invalidated contexts. Evidence: Affordable Generative Agents cut token cost to 31–43% of baseline with *higher* human-rated quality using exactly this pattern (cosine plan-match 0.97 + state conditions) — [arXiv:2402.02053](https://arxiv.org/abs/2402.02053).
@@ -144,8 +145,9 @@ Owns the **batch scheduler**: SOUL ticks batched per frame on desktop; mobile NP
 ### 10. Director / LOD
 Three rings — the AFK enabler:
 - **hot** (on screen): SOUL every tick, TEXT eligible
-- **warm** (nearby/plot-relevant): SOUL every N×10 ticks
+- **warm** (nearby/plot-relevant): SOUL on its configured cadence (every N ticks)
 - **cold** (everyone else): no NN — analytic resolution from persona stats: `state += rate·min(Δt, cap)`, discrete cycles = `floor(Δt/cycle)`, event ledger for catch-up digest
+The v0 Director computes the live ring for each entity, and `World::step_gated` enforces it: hot entities run every tick, warm entities run on cadence, and cold entities receive a zero-mask idle observation. Analytic cold fast-forward is recorded separately as an `FfSegment`.
 
 Prior art: Dwarf Fortress worldgen/history-as-event-log, RimWorld world-pawns (persist as data, no ticking), X4 out-of-sector numeric combat, Football Manager Instant Result. AFK/offline = run mostly cold at high speed; promote to hot around notable events; digest on return.
 
@@ -155,6 +157,29 @@ A pack = entity/component schemas + action manifest + intent-validation rules + 
 ## v0 milestone (vertical slice)
 
 Deterministic kernel + one village scenario, ~50 agents, utility-AI SOUL stub, one shared TEXT model with latent dialogue, hot/cold LOD, fast-forward. **No trained models in v0** — it proves the intent/observation contracts and the latent-dialogue bet; the tiny net then drops into a working socket.
+
+## Implementation status (v0)
+
+**Verified 2026-07-13.** The vertical slice shipped with a deterministic integer kernel, one village scenario and ~50-agent utility-AI SOUL loop, persona and memory state, shared Qwen3-0.6B Q4_0 TEXT rendering, latent dialogue, live hot/warm/cold LOD, analytic AFK fast-forward with a returning-player digest, replay, and a Ratatui viewer with a headless smoke path. No trained SOUL model is included in v0; the utility policy occupies the production `SoulPolicy` socket.
+
+Measured gates:
+
+| Area | Result |
+| --- | --- |
+| Determinism/replay | Same seed, 10,000 ticks: identical hash. Replay from `(seed, intent log)`, including `FfSegment` entries, reproduces the full state hash including pack state. |
+| Live village | 50 agents at 12,893 ticks/s in release on an M4 Pro; maximum action-histogram share 37.9%. |
+| Analytic FF | 604,800 ticks (one in-game week) in 0.014 s (~43M ticks/s); drift versus the hot reference ≤4% (15% bound); digest deterministic. |
+| TEXT | Qwen3-0.6B Q4_0, 359 MiB via llama.cpp; warm render 79 ms; KV slot reuse reduces prompt tokens 104 → 1. M4 Pro Metal pp512 2691 t/s / tg128 193 t/s; CPU-only pp512 388 / tg128 76. |
+| Latent dialogue | Unobserved conversations make 0 `TextBackend` calls while relationship deltas apply; retroactive backfill is act-coherent and cached; text is one-way and never mutates sim state. |
+| Gates/viewer | 49 unit/integration tests + 4 live-model tests green; clippy `-D warnings` clean; `scripts/demo.sh` exits 0; Ratatui TUI verified in a real PTY and `view --smoke` exits 0 headless. |
+
+### Ratified v0 contract changes
+
+- **Canonical apply order replaces submission-order assumptions.** The kernel sorts each intent batch by entity id before validating and applying it. Per-entity RNG remains stateless and keyed by seed, entity, stream, and tick, which makes draws iteration-order independent; effect order is the canonical sort, including shared-cell conflicts.
+- **Pack state is hash state.** `ScenarioPack::hash_state` folds needs, inventories, ground items, and other pack-owned state into `World::state_hash`.
+- **Fast-forward is logged.** Cold analytic spans are `FfSegment` entries in the intent log; replay consumes those entries and applies the pack's analytic advance, so the log covers AFK time.
+- **Live LOD is a kernel gate.** The Director's hot/warm/cold decisions are enforced through `World::step_gated`, not by mutating world state outside the normal tick pipeline.
+- **Observation has two ratified layers.** `AgentObs` in `mw-agents` is the rich, SOUL-facing schema. Kernel `Observation` is the minimal seam and the single scan used to feed `ScenarioPack::afforded_tools`.
 
 ## Open questions
 
