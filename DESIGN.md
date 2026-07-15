@@ -172,9 +172,31 @@ Measured gates:
 | Habit cache | Honest hit rate 51.7% in the 50×10k soak and 50.7% in the 86,400-tick demo; 2,151 ticks/s habits-on versus 1,088 ticks/s off at 50×10k; deaths 0, deterministic hashes, and per-character divergence gate green. Speak/Give passthrough, urgency invalidation, and bounded TTLs preserve social behavior. |
 | Analytic FF | 604,800 ticks in 0.014 s (~43M ticks/s); drift versus the hot reference ≤4% under the 15% bound; digest deterministic. Analytic gains are read from village pack constants, with no duplicate calibration constants. |
 | Opinions, viewer, and server lifecycle | Opinion deltas are asymmetric and directional; live TEXT rendering is asynchronous; stale `llama-server` processes are reaped on startup. PID-reuse handling is narrowed but its TOCTOU is not atomic. |
-| TEXT | Qwen3-0.6B Q4_0, 359 MiB via llama.cpp; warm render 79 ms; KV-slot reuse reduces prompt tokens 104 → 1. M4 Pro Metal pp512 2691 t/s / tg128 193 t/s; CPU-only pp512 388 / tg128 76. |
+| TEXT | Qwen3-0.6B Q4_0, 364.5 MiB file via llama.cpp; warm render 79 ms; KV-slot reuse reduces prompt tokens 104 → 1. Fresh M4 Pro bake-off (llama.cpp b9960-a935fbffe, llama-bench, 3 reps, pp512/tg128): Metal 3,136.8 / 180.2 t/s; CPU-only 373.7 / 70.2 t/s. |
 | Latent dialogue | Unobserved conversations make 0 `TextBackend` calls while relationship deltas apply; retroactive backfill is act-coherent and cached; text is one-way and never mutates sim state. |
 | Gates/viewer | 58 tests green after the v0.5 review; `clippy -D warnings`, formatting, and `scripts/demo.sh` are clean; Ratatui TUI was verified in a real PTY and `view --smoke` exits 0 headless. |
+
+### TEXT bake-off (M4 Pro, 2026-07-15)
+
+The repeatable command is `REPS=3 scripts/bench_text.sh`; it downloads missing GGUFs into `~/.cache/mini-world/models`, runs `llama-bench` with Metal and `-ngl 0` CPU paths, and records `/usr/bin/time -l` maximum RSS. Prompt/decode columns are pp512/tg128 averages over three repetitions; RSS is the real process maximum, not the quantized file size.
+
+| Candidate (GGUF) | Metal prompt / decode tok/s | CPU prompt / decode tok/s | File MiB | Max RSS Metal / CPU MiB | llama.cpp load |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Qwen3-0.6B Q4_0 (incumbent) | 3,136.8 / 180.2 | 373.7 / 70.2 | 364.5 | 514.2 / 901.2 | loaded |
+| Qwen3.5-0.8B Q4_0 (hybrid Gated-DeltaNet + MoE) | 2,754.8 / 115.1 | 284.8 / 39.1 | 483.7 | 637.4 / 1,156.2 | loaded |
+| Gemma3-270M it Q4_K_M (floor) | 15,186.5 / 159.8 | 726.9 / 90.8 | 241.4 | 336.6 / 551.6 | loaded |
+
+All three candidates load and run on this llama.cpp build. Qwen3.5's hybrid architecture is therefore not a load blocker here, but runtime maturity is explicitly provisional: its decode is 36% slower than Qwen3 on Metal and 44% slower on CPU, while file size is 33% larger and CPU RSS is 28% higher. Its chat template also needed `chat_template_kwargs.enable_thinking=false`; otherwise the identical smoke request spent its 48-token budget in visible reasoning rather than dialogue.
+
+Identical OpenAI-message dialogue smoke (Metal, seed 1, temperature 0.7, `/no_think`, `enable_thinking=false`) produced:
+
+| Candidate | Output |
+| --- | --- |
+| Qwen3-0.6B Q4_0 | “It’s late for you, but I’m here to help. Let me know if there’s anything else I can assist with.” |
+| Qwen3.5-0.8B Q4_0 | “Give it three more seconds.” |
+| Gemma3-270M it Q4_K_M | “Thank you for your concern. I'll get it to you as soon as possible.” |
+
+**Recommendation:** keep **Qwen3-0.6B Q4_0 as the default TEXT tier**: it is materially faster than Qwen3.5 at decode, smaller, and lower-RSS while producing a usable smoke line. Use **Gemma3-270M Q4_K_M as the floor tier** for constrained devices: its 241.4 MiB file and 336.6 MiB Metal RSS are the lowest by a wide margin, and its 15,186.5 tok/s prompt path is useful for short latent-dialogue prompts, accepting weaker rendering quality and slightly slower decode than Qwen3 on this run. Do not promote Qwen3.5 to default until hybrid-architecture runtime behavior is re-benchmarked on the target llama.cpp release.
 
 The earlier 82.7% habit hit rate was pre-fix telemetry: cache accounting counted behavior that could suppress social scoring, and the first implementation allowed social lockout. The review made the telemetry truthful and always re-scored Speak/Give; 51.7% (soak) and 50.7% (demo) are the honest measurements.
 

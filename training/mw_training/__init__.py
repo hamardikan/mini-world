@@ -9,6 +9,16 @@ from .dataset import (
     load_jsonl,
 )
 from .model import MaskedPolicy, PolicyMLP, masked_logits
+from .omni import OmniDataset, OmniPolicy, descriptor_rows
+from .persona import (
+    NEED_NAMES,
+    PERSONALITY_OVERRIDE,
+    TRAIT_NAMES,
+    persona_sketch,
+    render_persona,
+    render_teacher_prompt,
+    teacher_prompt_fragment,
+)
 
 __all__ = [
     "FEATURE_DIM",
@@ -20,4 +30,14 @@ __all__ = [
     "encode_record",
     "load_jsonl",
     "masked_logits",
+    "OmniDataset",
+    "OmniPolicy",
+    "descriptor_rows",
+    "NEED_NAMES",
+    "PERSONALITY_OVERRIDE",
+    "TRAIT_NAMES",
+    "persona_sketch",
+    "render_persona",
+    "render_teacher_prompt",
+    "teacher_prompt_fragment",
 ]

@@ -15,7 +15,7 @@ use mw_agents::obs::N_STATS;
 use mw_agents::persona::{trait_idx, Persona};
 use mw_agents::soul::{Body, Choice, Social, ToolSem, UtilitySoul, TOOL_SLOTS};
 use mw_core::{AgentRng, EntityId, Intent, Observation, SoulPolicy, World};
-use mw_neural::{encode, NeuralRuntime};
+use mw_neural::{encode, NeuralRuntime, NeuralSoul};
 use mw_village::{tile_at, verb, Action, Item, Tile, VillagePack, GRID, MAX_NEED, TOOL_COUNT};
 
 /// Soak parameters.
@@ -49,6 +49,45 @@ pub struct SoakReport {
     pub habits_enabled: bool,
     pub habit_stats: HabitStats,
     pub habit_cache_sizes: Vec<usize>,
+}
+/// Side-by-side utility/neural results for one deterministic scenario config.
+/// Both reports use the same seed, population, and tick horizon; elapsed time
+/// remains report-only and is intentionally excluded from the comparison.
+#[derive(Clone, Debug)]
+pub struct SoakComparison {
+    pub utility: SoakReport,
+    pub neural: SoakReport,
+    pub deaths_delta: isize,
+    pub mean_needs_delta: [f64; N_STATS],
+    pub histogram_delta: [i64; TOOL_SLOTS],
+}
+
+impl SoakComparison {
+    fn new(utility: SoakReport, neural: SoakReport) -> Self {
+        let mut histogram_delta = [0i64; TOOL_SLOTS];
+        for (delta, (&n, &u)) in histogram_delta
+            .iter_mut()
+            .zip(neural.histogram.iter().zip(utility.histogram.iter()))
+        {
+            *delta = n as i64 - u as i64;
+        }
+        let utility_needs = utility.mean_needs();
+        let neural_needs = neural.mean_needs();
+        let mut mean_needs_delta = [0.0; N_STATS];
+        for (delta, (&n, &u)) in mean_needs_delta
+            .iter_mut()
+            .zip(neural_needs.iter().zip(utility_needs.iter()))
+        {
+            *delta = n - u;
+        }
+        Self {
+            deaths_delta: neural.deaths as isize - utility.deaths as isize,
+            utility,
+            neural,
+            mean_needs_delta,
+            histogram_delta,
+        }
+    }
 }
 
 impl SoakReport {
@@ -213,7 +252,7 @@ enum ActiveSoul {
 /// argmaxes and a deterministic safety action handles an idle collapse.
 struct NeuralSoulAdapter {
     observer: UtilitySoul<VillageBody>,
-    runtime: NeuralRuntime,
+    policy: NeuralSoul,
     pending: Vec<(Intent, u32, Intent, u32)>,
     cursor: usize,
     hist: [u64; TOOL_SLOTS],
@@ -232,6 +271,14 @@ impl NeuralSoulAdapter {
             .iter()
             .map(|&id| Memory::new(id, verb_affect()))
             .collect();
+        let policy = NeuralSoul::with_context(
+            runtime,
+            0,
+            Persona {
+                traits: [500; mw_agents::persona::N_TRAITS],
+                weights: [500; mw_agents::persona::N_WEIGHTS],
+            },
+        );
         Self {
             observer: UtilitySoul::new(
                 VillageBody::new(pack, factions),
@@ -241,7 +288,7 @@ impl NeuralSoulAdapter {
                 memories,
                 positions,
             ),
-            runtime,
+            policy,
             pending: Vec::new(),
             cursor: 0,
             hist: [0; TOOL_SLOTS],
@@ -268,10 +315,10 @@ impl NeuralSoulAdapter {
                 let persona = self.observer.persona_at(slot).ok_or_else(|| {
                     mw_neural::Error::Shape(format!("missing persona for slot {slot}"))
                 })?;
-                encode(slot as u32, &persona, obs, self.runtime.norm())
+                encode(slot as u32, &persona, obs, self.policy.runtime().norm())
             })
             .collect::<Result<_, _>>()?;
-        let outputs = self.runtime.infer(&rows)?;
+        let outputs = self.policy.infer_batch(&rows)?;
         self.pending = outputs
             .iter()
             .zip(rich.iter())
@@ -715,6 +762,7 @@ fn run_neural_logged(
             .map(|&id| {
                 let mut obs = world.observe(id);
                 obs.tool_mask = mw_core::ScenarioPack::afforded_tools(&*pack, &world, id, &obs);
+
                 obs
             })
             .collect();
@@ -753,6 +801,16 @@ fn run_neural_logged(
         pack,
         positions,
     })
+}
+/// Run utility and neural policies against identical initial state/configuration
+/// and return report deltas for the CLI A/B gate.
+pub fn run_ab(
+    cfg: SoakConfig,
+    model_path: impl AsRef<std::path::Path>,
+) -> Result<SoakComparison, mw_neural::Error> {
+    let utility = run_with_habits(cfg, false);
+    let neural = run_neural(cfg, model_path)?;
+    Ok(SoakComparison::new(utility, neural))
 }
 
 #[cfg(test)]

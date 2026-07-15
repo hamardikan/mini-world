@@ -19,10 +19,11 @@ enum HabitsFlag {
     Off,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum PolicyFlag {
     Utility,
     Neural,
+    Both,
 }
 
 #[derive(Parser)]
@@ -66,7 +67,7 @@ enum Command {
         agents: i32,
         #[arg(long, default_value_t = 1)]
         seed: u64,
-        /// Utility or batched neural policy.
+        /// Utility, neural, or both for an A/B comparison on the same seed.
         #[arg(long, value_enum, default_value_t = PolicyFlag::Utility)]
         policy: PolicyFlag,
         /// ONNX model path for `--policy neural`.
@@ -146,8 +147,25 @@ fn run_kernel(ticks: u64, entities: i32, seed: u64) {
         world.state_hash(&pack),
     );
 }
-
 fn run_soak(ticks: u64, agents: i32, seed: u64, policy: PolicyFlag, onnx_path: &str, habits: bool) {
+    if policy == PolicyFlag::Both {
+        let comparison = match soak::run_ab(
+            SoakConfig {
+                seed,
+                agents,
+                ticks,
+            },
+            onnx_path,
+        ) {
+            Ok(comparison) => comparison,
+            Err(e) => {
+                eprintln!("neural soak failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        print_ab(&comparison);
+        return;
+    }
     let report = match policy {
         PolicyFlag::Utility => Ok(soak::run_with_habits(
             SoakConfig {
@@ -165,6 +183,7 @@ fn run_soak(ticks: u64, agents: i32, seed: u64, policy: PolicyFlag, onnx_path: &
             },
             onnx_path,
         ),
+        PolicyFlag::Both => unreachable!("handled above"),
     };
     let report = match report {
         Ok(report) => report,
@@ -173,6 +192,10 @@ fn run_soak(ticks: u64, agents: i32, seed: u64, policy: PolicyFlag, onnx_path: &
             std::process::exit(1);
         }
     };
+    print_report(&report, policy, habits);
+}
+
+fn print_report(report: &soak::SoakReport, policy: PolicyFlag, habits: bool) {
     println!(
         "soak seed={} agents={} ticks={} policy={:?} habits={}",
         report.cfg.seed, report.cfg.agents, report.cfg.ticks, policy, habits
@@ -206,6 +229,44 @@ fn run_soak(ticks: u64, agents: i32, seed: u64, policy: PolicyFlag, onnx_path: &
     );
     for line in report.histogram_lines() {
         println!("{line}");
+    }
+}
+
+fn print_ab(comparison: &soak::SoakComparison) {
+    let utility = &comparison.utility;
+    let neural = &comparison.neural;
+    println!(
+        "soak A/B seed={} agents={} ticks={} (same initial state)",
+        utility.cfg.seed, utility.cfg.agents, utility.cfg.ticks
+    );
+    for (name, report) in [("UtilitySoul", utility), ("NeuralSoul", neural)] {
+        let mean = report.mean_needs();
+        println!(
+            "{name}: deaths={} mean_needs hunger={:.0} energy={:.0} social={:.0} hash={:#018x}",
+            report.deaths, mean[0], mean[1], mean[2], report.final_hash
+        );
+        println!("{name} action histogram:");
+        for line in report.histogram_lines() {
+            println!("{line}");
+        }
+    }
+    println!(
+        "deltas neural-utility: deaths={:+} mean_needs hunger={:+.1} energy={:+.1} social={:+.1}",
+        comparison.deaths_delta,
+        comparison.mean_needs_delta[0],
+        comparison.mean_needs_delta[1],
+        comparison.mean_needs_delta[2],
+    );
+    println!("action histogram deltas neural-utility:");
+    for (id, delta) in comparison.histogram_delta.iter().enumerate() {
+        if *delta == 0 {
+            continue;
+        }
+        let name = mw_village::Action::from_id(id as u32).map_or_else(
+            || format!("tool_{id}"),
+            |action| format!("{action:?}").to_lowercase(),
+        );
+        println!("  {name:<7} {delta:+}");
     }
 }
 

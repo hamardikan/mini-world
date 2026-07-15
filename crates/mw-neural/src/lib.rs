@@ -408,6 +408,7 @@ impl SoulPolicy for NeuralSoul {
 mod tests {
     use super::*;
     use mw_agents::obs::NeighborView;
+    use mw_core::{agent_rng, stream, Intent, SoulPolicy, World};
     #[test]
     fn encoder_layout_and_normalization() {
         let norm = NormStats {
@@ -462,6 +463,20 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].tool, 11);
         assert_eq!(out[0].target_slot, None);
+    }
+    #[test]
+    fn neural_soul_implements_policy_socket() {
+        let mut soul = NeuralSoul::load(
+            "../../training/artifacts/model.onnx",
+            "../../training/artifacts/norm_stats.json",
+        )
+        .unwrap();
+        let mut world = World::new(7);
+        let id = world.spawn((0, 0));
+        let mut observation = world.observe(id);
+        observation.tool_mask = 1 << 11;
+        let mut rng = agent_rng(7, id, stream::SOUL, observation.tick);
+        assert_eq!(soul.decide(&observation, &mut rng), Intent::Idle);
     }
     #[derive(Debug, Deserialize)]
     struct FixtureFile {
