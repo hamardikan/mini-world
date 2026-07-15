@@ -6,10 +6,13 @@
 //! and batched inference.  The kernel's validated intent log remains the replay
 //! authority; floating point output is advisory.
 
+use blake2::{Blake2s256, Digest};
 use mw_agents::obs::{AgentObs, K_NEIGHBORS, N_EVENT_KINDS, N_STATS};
 use mw_agents::persona::{Persona, N_TRAITS, N_WEIGHTS};
 use mw_core::{AgentRng, Intent, Observation, SoulPolicy};
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -88,11 +91,144 @@ pub struct EncodedInput {
     pub mask: u32,
     pub present: u8,
 }
+/// Descriptor width used by the training exporter.
+pub const OMNI_DESCRIPTOR_DIM: usize = 16;
+pub const OMNI_PARAM_DIM: usize = 4;
+
+/// Inputs to one OMNI policy row. Descriptor rows are flattened row-major.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OmniEncodedInput {
+    pub features: [f32; FEATURE_DIM],
+    pub tool_descriptors: Vec<f32>,
+    pub tool_ids: Vec<u32>,
+    pub afforded: Vec<bool>,
+    pub present: u8,
+}
+
+impl OmniEncodedInput {
+    fn validate(&self) -> Result<usize, Error> {
+        if self.afforded.is_empty() {
+            return Err(Error::Shape(
+                "OMNI manifest must contain at least one tool".into(),
+            ));
+        }
+        if self.tool_ids.len() != self.afforded.len() {
+            return Err(Error::Shape(format!(
+                "OMNI tool ids have {}, expected {}",
+                self.tool_ids.len(),
+                self.afforded.len()
+            )));
+        }
+        let expected = self.afforded.len() * OMNI_DESCRIPTOR_DIM;
+        if self.tool_descriptors.len() != expected {
+            return Err(Error::Shape(format!(
+                "OMNI descriptors have {}, expected {expected}",
+                self.tool_descriptors.len()
+            )));
+        }
+        Ok(self.afforded.len())
+    }
+}
+
+/// Deterministic BLAKE2s feature matching `mw_training.omni._stable_unit`.
+fn stable_unit(text: &str) -> f32 {
+    let digest = Blake2s256::digest(text.as_bytes());
+    let value = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    value as f32 / 4_294_967_296.0
+}
+
+/// Encode manifest descriptors exactly as the Python OMNI exporter does.
+pub fn descriptor_rows(manifest: &mw_core::ActionManifest) -> Result<Vec<f32>, Error> {
+    use mw_core::ArgKind;
+    if manifest.tools.is_empty() {
+        return Err(Error::Shape(
+            "OMNI manifest must contain at least one tool".into(),
+        ));
+    }
+    let last = manifest.tools.len().saturating_sub(1).max(1) as f32;
+    let mut rows = Vec::with_capacity(manifest.tools.len() * OMNI_DESCRIPTOR_DIM);
+    for (index, tool) in manifest.tools.iter().enumerate() {
+        let kinds: Vec<&str> = tool
+            .args
+            .iter()
+            .map(|arg| match &arg.kind {
+                ArgKind::EntityRef => "entity",
+                ArgKind::Scalar => "scalar",
+                ArgKind::Enum { .. } => "enum",
+            })
+            .collect();
+        let lower = tool.name.to_lowercase();
+        let has_entity = kinds
+            .iter()
+            .any(|kind| matches!(*kind, "entity" | "entity_ref" | "pointer"));
+        let has_scalar = kinds
+            .iter()
+            .any(|kind| matches!(*kind, "scalar" | "number" | "float" | "int"));
+        let has_enum = kinds
+            .iter()
+            .any(|kind| matches!(*kind, "enum" | "string" | "item"));
+        let kind_text = kinds.join(",");
+        rows.extend([
+            index as f32 / last,
+            kinds.len() as f32 / 8.0,
+            has_entity as u8 as f32 / 8.0,
+            has_scalar as u8 as f32 / 8.0,
+            has_enum as u8 as f32 / 8.0,
+            stable_unit(&tool.name),
+            stable_unit(&lower),
+            lower.contains("move") as u8 as f32,
+            (lower.contains("speak") || lower.contains("talk")) as u8 as f32,
+            (lower.contains("idle") || lower.contains("wait")) as u8 as f32,
+            (lower.contains("target") || has_entity) as u8 as f32,
+            (lower.contains("param") || !kinds.is_empty()) as u8 as f32,
+            (index % 7) as f32 / 7.0,
+            (index % 11) as f32 / 11.0,
+            stable_unit(&format!("args:{kind_text}")),
+            1.0,
+        ]);
+    }
+    Ok(rows)
+}
+
+/// Encode a rich observation for an OMNI manifest-conditioned model.
+pub fn encode_omni(
+    agent_slot: u32,
+    persona: &Persona,
+    obs: &AgentObs,
+    norm: &NormStats,
+    manifest: &mw_core::ActionManifest,
+) -> Result<OmniEncodedInput, Error> {
+    let base = encode(agent_slot, persona, obs, norm)?;
+    Ok(OmniEncodedInput {
+        features: base.features,
+        tool_descriptors: descriptor_rows(manifest)?,
+        tool_ids: manifest.tools.iter().map(|tool| tool.id).collect(),
+        afforded: manifest
+            .tools
+            .iter()
+            .map(|tool| tool.id < 32 && obs.tool_mask & (1u32 << tool.id) != 0)
+            .collect(),
+        present: base.present,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PolicyLogits {
     pub tool: [f32; N_TOOLS],
     pub target: [f32; K_NEIGHBORS],
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct OmniPolicyLogits {
+    pub tool_scores: Vec<f32>,
+    pub target: [f32; K_NEIGHBORS],
+    pub params: [f32; OMNI_PARAM_DIM],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OmniPolicyOutput {
+    pub tool: u32,
+    pub target_slot: Option<usize>,
+    pub params: [f32; OMNI_PARAM_DIM],
 }
 
 /// Result after hard affordance masking and deterministic argmax.
@@ -269,6 +405,189 @@ impl NeuralRuntime {
             .collect())
     }
 }
+type OmniModel = tract_hir::internal::InferenceModel;
+type OmniPlan = TypedRunnableModel<TypedModel>;
+
+// Tract cannot optimize the exported symbolic Expand for a dynamic tool axis;
+// specialize concrete `(batch, tools)` facts once and reuse each plan.
+fn compile_omni_plan(model: &OmniModel, batch: usize, tools: usize) -> Result<OmniPlan, Error> {
+    let mut model = model.clone();
+    model
+        .set_input_fact(
+            0,
+            InferenceFact::dt_shape(f32::datum_type(), [batch, FEATURE_DIM]),
+        )
+        .map_err(Error::Inference)?;
+    model
+        .set_input_fact(
+            1,
+            InferenceFact::dt_shape(f32::datum_type(), [batch, tools, OMNI_DESCRIPTOR_DIM]),
+        )
+        .map_err(Error::Inference)?;
+    model
+        .set_input_fact(
+            2,
+            InferenceFact::dt_shape(f32::datum_type(), [batch, tools]),
+        )
+        .map_err(Error::Inference)?;
+    model
+        .into_typed()
+        .map_err(Error::Inference)?
+        .into_runnable()
+        .map_err(Error::Inference)
+}
+
+/// Dynamic-manifest ONNX runtime. Tool rows remain data, so a manifest can
+/// grow without changing the output classifier.
+pub struct OmniRuntime {
+    model: OmniModel,
+    norm: NormStats,
+    plans: RefCell<HashMap<(usize, usize), OmniPlan>>,
+}
+
+impl OmniRuntime {
+    pub fn load(model_path: impl AsRef<Path>, norm_path: impl AsRef<Path>) -> Result<Self, Error> {
+        let norm = NormStats::from_path(norm_path)?;
+        let model = onnx()
+            .model_for_path(model_path)
+            .map_err(Error::Inference)?;
+        Ok(Self {
+            model,
+            norm,
+            plans: RefCell::new(HashMap::new()),
+        })
+    }
+
+    pub fn norm(&self) -> &NormStats {
+        &self.norm
+    }
+
+    pub fn infer_logits(&self, rows: &[OmniEncodedInput]) -> Result<Vec<OmniPolicyLogits>, Error> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tools = rows[0].validate()?;
+        if rows.iter().any(|row| row.validate().ok() != Some(tools)) {
+            return Err(Error::Shape(
+                "OMNI batch rows must have the same tool count".into(),
+            ));
+        }
+        let batch = rows.len();
+        let plan_key = (batch, tools);
+        if !self.plans.borrow().contains_key(&plan_key) {
+            let plan = compile_omni_plan(&self.model, batch, tools)?;
+            self.plans.borrow_mut().insert(plan_key, plan);
+        }
+        let mut obs_data = Vec::with_capacity(batch * FEATURE_DIM);
+        let mut descriptor_data = Vec::with_capacity(batch * tools * OMNI_DESCRIPTOR_DIM);
+        let mut afforded_data = Vec::with_capacity(batch * tools);
+        for row in rows {
+            obs_data.extend_from_slice(&row.features);
+            descriptor_data.extend_from_slice(&row.tool_descriptors);
+            afforded_data.extend(
+                row.afforded
+                    .iter()
+                    .map(|&value| if value { 1.0f32 } else { 0.0f32 }),
+            );
+        }
+        let obs = Tensor::from_shape(&[batch, FEATURE_DIM], &obs_data)
+            .map_err(|e| Error::Shape(e.to_string()))?;
+        let descriptors =
+            Tensor::from_shape(&[batch, tools, OMNI_DESCRIPTOR_DIM], &descriptor_data)
+                .map_err(|e| Error::Shape(e.to_string()))?;
+        let afforded = Tensor::from_shape(&[batch, tools], &afforded_data)
+            .map_err(|e| Error::Shape(e.to_string()))?;
+        let plans = self.plans.borrow();
+        let outputs = plans
+            .get(&plan_key)
+            .expect("OMNI plan inserted above")
+            .run(tvec![obs.into(), descriptors.into(), afforded.into()])
+            .map_err(Error::Inference)?;
+        if outputs.len() < 3 {
+            return Err(Error::Shape(format!(
+                "expected three OMNI outputs, got {}",
+                outputs.len()
+            )));
+        }
+        let scores = outputs[0]
+            .to_array_view::<f32>()
+            .map_err(Error::Inference)?;
+        let targets = outputs[1]
+            .to_array_view::<f32>()
+            .map_err(Error::Inference)?;
+        let params = outputs[2]
+            .to_array_view::<f32>()
+            .map_err(Error::Inference)?;
+        let mut result = Vec::with_capacity(batch);
+        for row in 0..batch {
+            let mut tool_scores = Vec::with_capacity(tools);
+            for tool in 0..tools {
+                tool_scores.push(scores[[row, tool]]);
+            }
+            let mut target = [0.0; K_NEIGHBORS];
+            for slot in 0..K_NEIGHBORS {
+                target[slot] = targets[[row, slot]];
+            }
+            let mut parameter = [0.0; OMNI_PARAM_DIM];
+            for parameter_index in 0..OMNI_PARAM_DIM {
+                parameter[parameter_index] = params[[row, parameter_index]];
+            }
+            result.push(OmniPolicyLogits {
+                tool_scores,
+                target,
+                params: parameter,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn infer(&self, rows: &[OmniEncodedInput]) -> Result<Vec<OmniPolicyOutput>, Error> {
+        let logits = self.infer_logits(rows)?;
+        Ok(logits
+            .into_iter()
+            .zip(rows)
+            .map(|(logit, row)| {
+                let tool = argmax_omni_tool(&logit.tool_scores, row);
+                OmniPolicyOutput {
+                    tool,
+                    target_slot: argmax_target_omni(&logit.target, row.present),
+                    params: logit.params,
+                }
+            })
+            .collect())
+    }
+}
+
+fn argmax_omni_tool(scores: &[f32], row: &OmniEncodedInput) -> u32 {
+    let mut best = None;
+    let mut best_value = f32::NEG_INFINITY;
+    for (index, &score) in scores.iter().enumerate() {
+        if !row.afforded[index] {
+            continue;
+        }
+        if score > best_value {
+            best = Some(row.tool_ids[index]);
+            best_value = score;
+        }
+    }
+    best.or_else(|| row.tool_ids.iter().copied().find(|&id| id == 11))
+        .unwrap_or(row.tool_ids[0])
+}
+
+fn argmax_target_omni(logits: &[f32; K_NEIGHBORS], present: u8) -> Option<usize> {
+    let mut best = None;
+    let mut best_value = f32::NEG_INFINITY;
+    for (slot, &value) in logits.iter().enumerate() {
+        if present & (1 << slot) == 0 {
+            continue;
+        }
+        if value > best_value {
+            best = Some(slot);
+            best_value = value;
+        }
+    }
+    best
+}
 fn argmax_tool(logits: &[f32; N_TOOLS], mask: u32) -> u32 {
     if mask == 0 {
         return 11;
@@ -299,6 +618,30 @@ fn argmax_target(logits: &[f32; K_NEIGHBORS], input: &EncodedInput) -> Option<us
         }
     }
     best
+}
+
+fn minimal_agent_obs(observation: &Observation) -> AgentObs {
+    let mut neighbors = [mw_agents::obs::NeighborView::default(); K_NEIGHBORS];
+    for (slot, n) in observation.neighbors.iter().enumerate() {
+        if slot >= K_NEIGHBORS {
+            break;
+        }
+        neighbors[slot].present = n.present;
+        neighbors[slot].id = Some(n.id);
+        neighbors[slot].rel_pos = (n.dx, n.dy);
+        neighbors[slot].pos = (observation.self_pos.0 + n.dx, observation.self_pos.1 + n.dy);
+        neighbors[slot].dist2 = n.dx * n.dx + n.dy * n.dy;
+    }
+    AgentObs {
+        tick: observation.tick,
+        self_stats: [500; N_STATS],
+        self_pos: observation.self_pos,
+        self_cell_class: 0,
+        neighbors,
+        events: [0; N_EVENT_KINDS],
+        tool_mask: observation.tool_mask,
+        goal: 0,
+    }
 }
 
 /// Convenience policy. For full rich observations use `infer_agent`; the
@@ -347,27 +690,7 @@ impl NeuralSoul {
 }
 impl SoulPolicy for NeuralSoul {
     fn decide(&mut self, observation: &Observation, _rng: &mut AgentRng) -> Intent {
-        let mut neighbors = [mw_agents::obs::NeighborView::default(); K_NEIGHBORS];
-        for (slot, n) in observation.neighbors.iter().enumerate() {
-            if slot >= K_NEIGHBORS {
-                break;
-            }
-            neighbors[slot].present = n.present;
-            neighbors[slot].id = Some(n.id);
-            neighbors[slot].rel_pos = (n.dx, n.dy);
-            neighbors[slot].pos = (observation.self_pos.0 + n.dx, observation.self_pos.1 + n.dy);
-            neighbors[slot].dist2 = n.dx * n.dx + n.dy * n.dy;
-        }
-        let obs = AgentObs {
-            tick: observation.tick,
-            self_stats: [500; N_STATS],
-            self_pos: observation.self_pos,
-            self_cell_class: 0,
-            neighbors,
-            events: [0; N_EVENT_KINDS],
-            tool_mask: observation.tool_mask,
-            goal: 0,
-        };
+        let obs = minimal_agent_obs(observation);
         let out = self
             .infer_agent(self.agent_slot, &self.persona, &obs)
             .unwrap_or(PolicyOutput {
@@ -400,6 +723,114 @@ impl SoulPolicy for NeuralSoul {
                         verb: tool,
                     })
             }
+        }
+    }
+}
+/// Manifest-conditioned SOUL adapter for the dynamic OMNI graph.
+pub struct OmniSoul {
+    runtime: OmniRuntime,
+    persona: Persona,
+    agent_slot: u32,
+    manifest: mw_core::ActionManifest,
+}
+
+impl OmniSoul {
+    pub fn load(
+        model_path: impl AsRef<Path>,
+        norm_path: impl AsRef<Path>,
+        manifest: mw_core::ActionManifest,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            runtime: OmniRuntime::load(model_path, norm_path)?,
+            persona: Persona {
+                traits: [500; N_TRAITS],
+                weights: [500; N_WEIGHTS],
+            },
+            agent_slot: 0,
+            manifest,
+        })
+    }
+
+    pub fn with_context(
+        runtime: OmniRuntime,
+        agent_slot: u32,
+        persona: Persona,
+        manifest: mw_core::ActionManifest,
+    ) -> Self {
+        Self {
+            runtime,
+            agent_slot,
+            persona,
+            manifest,
+        }
+    }
+
+    pub fn runtime(&self) -> &OmniRuntime {
+        &self.runtime
+    }
+
+    pub fn infer_agent(
+        &self,
+        agent_slot: u32,
+        persona: &Persona,
+        obs: &AgentObs,
+    ) -> Result<OmniPolicyOutput, Error> {
+        let row = encode_omni(
+            agent_slot,
+            persona,
+            obs,
+            self.runtime.norm(),
+            &self.manifest,
+        )?;
+        self.runtime
+            .infer(std::slice::from_ref(&row))
+            .map(|mut outputs| outputs.remove(0))
+    }
+
+    pub fn infer_batch(&self, rows: &[OmniEncodedInput]) -> Result<Vec<OmniPolicyOutput>, Error> {
+        self.runtime.infer(rows)
+    }
+}
+
+impl SoulPolicy for OmniSoul {
+    fn decide(&mut self, observation: &Observation, _rng: &mut AgentRng) -> Intent {
+        let obs = minimal_agent_obs(observation);
+        let out = self
+            .infer_agent(self.agent_slot, &self.persona, &obs)
+            .unwrap_or(OmniPolicyOutput {
+                tool: 11,
+                target_slot: None,
+                params: [0.0; OMNI_PARAM_DIM],
+            });
+        match out.tool {
+            0 => {
+                let (dx, dy) = out
+                    .target_slot
+                    .and_then(|slot| {
+                        obs.neighbors[slot]
+                            .present
+                            .then_some(obs.neighbors[slot].rel_pos)
+                    })
+                    .map(|(x, y)| (x.signum(), y.signum()))
+                    .unwrap_or((1, 0));
+                Intent::Move { dx, dy }
+            }
+            4 => out
+                .target_slot
+                .and_then(|slot| obs.neighbors[slot].id)
+                .map_or(Intent::Idle, |target| Intent::Speak {
+                    target,
+                    act: 0,
+                    topic: 0,
+                }),
+            11 => Intent::Idle,
+            tool => out
+                .target_slot
+                .and_then(|slot| obs.neighbors[slot].id)
+                .map_or(Intent::Idle, |target| Intent::Interact {
+                    target,
+                    verb: tool,
+                }),
         }
     }
 }
