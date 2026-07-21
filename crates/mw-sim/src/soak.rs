@@ -13,10 +13,11 @@ use mw_agents::habits::{HabitContext, HabitSoul, HabitStats};
 use mw_agents::memory::{Memory, OPINION_ONE};
 use mw_agents::obs::N_STATS;
 use mw_agents::persona::{trait_idx, Persona};
-use mw_agents::soul::{Body, Choice, Social, ToolSem, UtilitySoul, TOOL_SLOTS};
+use mw_agents::soul::{Social, ToolSem, UtilitySoul, TOOL_SLOTS};
 use mw_core::{AgentRng, EntityId, Intent, Observation, ScenarioPack, SoulPolicy, World};
 use mw_neural::{encode, encode_omni_with_expertise, ExpertiseLevel, NeuralRuntime, NeuralSoul, OmniEncodedInput, OmniRuntime, OmniSoul};
-use mw_village::{tile_at, verb, Action, Item, Tile, VillagePack, GRID, MAX_NEED, TOOL_COUNT};
+use mw_village::{tile_at, verb, Action, Item, Tile, VillagePack, MAX_NEED, TOOL_COUNT};
+use mw_runtime::{start_positions, VillageBody};
 
 /// Soak parameters.
 #[derive(Clone, Copy, Debug)]
@@ -147,97 +148,6 @@ impl SoakReport {
     }
 }
 
-/// The scenario side of the SOUL socket for the village: needs projection,
-/// precomputed factions, and turning a chosen tool into a kernel intent with the
-/// village's routing + verb codec.
-pub struct VillageBody {
-    pack: Rc<VillagePack>,
-    factions: Vec<u8>,
-}
-
-impl VillageBody {
-    /// Wrap a shared pack and its precomputed faction table. The `Rc` lets the
-    /// body live inside a soul that is stored alongside the pack (the TUI keeps
-    /// both in one struct) without a self-referential borrow.
-    pub fn new(pack: Rc<VillagePack>, factions: Vec<u8>) -> Self {
-        Self { pack, factions }
-    }
-}
-
-impl Body for VillageBody {
-    fn self_stats(&self, entity: EntityId, tick: u64) -> [i16; N_STATS] {
-        let (h, en, so) = self.pack.needs(entity).project(tick);
-        [h as i16, en as i16, so as i16]
-    }
-
-    fn cell_class(&self, pos: (i32, i32)) -> u8 {
-        match tile_at(pos) {
-            Tile::Empty => 0,
-            Tile::Home => 1,
-            Tile::Bakery => 2,
-            Tile::Well => 3,
-            Tile::Field => 4,
-        }
-    }
-    fn faction(&self, entity: EntityId) -> u8 {
-        self.factions
-            .get(entity.index() as usize)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn to_intent(&self, entity: EntityId, tick: u64, from: (i32, i32), choice: &Choice) -> Intent {
-        let Some(action) = Action::from_id(choice.tool) else {
-            return Intent::Idle;
-        };
-        match action {
-            Action::Idle => Intent::Idle,
-            // Location/self acts ride an Interact whose target is self (the
-            // pack ignores the target for these; it only needs to exist).
-            Action::Eat => interact(entity, Action::Eat, Item::Food),
-            Action::Sleep => interact(entity, Action::Sleep, Item::Food),
-            Action::Work => interact(entity, Action::Work, Item::Food),
-            Action::Use => interact(entity, Action::Use, Item::Water),
-            Action::Drop => interact(entity, Action::Drop, self.held(entity)),
-            Action::Pickup => interact(entity, Action::Pickup, self.on_ground(from)),
-            // Social acts target a chosen neighbor.
-            Action::Speak => match choice.target {
-                Some(t) => Intent::Speak {
-                    target: t,
-                    act: 0,
-                    topic: 0,
-                },
-                None => Intent::Idle,
-            },
-            Action::Give => match choice.target {
-                Some(t) => Intent::Interact {
-                    target: t,
-                    verb: verb(Action::Give, self.held(entity)),
-                },
-                None => Intent::Idle,
-            },
-            // Movement tools resolve to a single kernel step.
-            Action::Move => step_toward(from, self.destination(entity, tick, from), false),
-            Action::Follow => match choice.target_pos {
-                Some(tp) => step_toward(from, tp, false),
-                None => Intent::Idle,
-            },
-            Action::Flee => match choice.target_pos {
-                Some(tp) => step_toward(from, tp, true),
-                None => Intent::Idle,
-            },
-        }
-    }
-
-    fn tool_for_intent(&self, intent: &Intent) -> Option<u32> {
-        match intent {
-            Intent::Move { .. } => Some(Action::Move.id()),
-            Intent::Speak { .. } => Some(Action::Speak.id()),
-            Intent::Interact { verb, .. } => mw_village::decode(*verb).0.map(Action::id),
-            Intent::Idle => Some(Action::Idle.id()),
-        }
-    }
-}
 
 type VillageSoul = UtilitySoul<VillageBody>;
 enum AdvisoryPolicy {
@@ -542,97 +452,8 @@ impl ActiveSoul {
     }
 }
 
-impl VillageBody {
-    /// An item the entity carries (food first), for give/drop.
-    fn held(&self, entity: EntityId) -> Item {
-        if self.pack.inventory(entity, Item::Food) > 0 {
-            Item::Food
-        } else {
-            Item::Water
-        }
-    }
 
-    /// An item lying on the entity's tile (food first), for pickup.
-    fn on_ground(&self, pos: (i32, i32)) -> Item {
-        let g = self.pack.ground_at(pos);
-        if g[Item::Food as usize] > 0 {
-            Item::Food
-        } else {
-            Item::Water
-        }
-    }
 
-    /// Where to head for the most-pressing need: food when hungry, a home tile
-    /// when tired, otherwise the bakery — the natural gathering hub where crowds
-    /// (and speak/give opportunities) form.
-    fn destination(&self, entity: EntityId, tick: u64, from: (i32, i32)) -> (i32, i32) {
-        let (h, en, so) = self.pack.needs(entity).project(tick);
-        let (dh, de, ds) = (MAX_NEED - h, MAX_NEED - en, MAX_NEED - so);
-        if dh >= de && dh >= ds {
-            nearest(from, |t| matches!(t, Tile::Bakery | Tile::Field))
-        } else if de >= ds {
-            nearest(from, |t| t == Tile::Home)
-        } else {
-            (8, 8)
-        }
-    }
-}
-
-fn interact(entity: EntityId, action: Action, item: Item) -> Intent {
-    Intent::Interact {
-        target: entity,
-        verb: verb(action, item),
-    }
-}
-
-fn in_bounds(p: (i32, i32)) -> bool {
-    (0..GRID).contains(&p.0) && (0..GRID).contains(&p.1)
-}
-
-/// One unit step toward (or away from) `to`, dropping any axis that would leave
-/// the map. Diagonals are legal (Chebyshev range 1). A fully blocked step idles.
-fn step_toward(from: (i32, i32), to: (i32, i32), away: bool) -> Intent {
-    let sign = |d: i32| d.signum();
-    let (mut dx, mut dy) = (sign(to.0 - from.0), sign(to.1 - from.1));
-    if away {
-        dx = -dx;
-        dy = -dy;
-    }
-    if !in_bounds((from.0 + dx, from.1)) {
-        dx = 0;
-    }
-    if !in_bounds((from.0, from.1 + dy)) {
-        dy = 0;
-    }
-    if dx == 0 && dy == 0 {
-        Intent::Idle
-    } else {
-        Intent::Move { dx, dy }
-    }
-}
-
-/// Nearest tile (by Chebyshev distance) satisfying `pred`; ties resolve by
-/// scan order so the result is deterministic. Falls back to the bakery.
-fn nearest(from: (i32, i32), pred: impl Fn(Tile) -> bool) -> (i32, i32) {
-    let mut best: Option<(i32, (i32, i32))> = None;
-    for y in 0..GRID {
-        for x in 0..GRID {
-            if pred(tile_at((x, y))) {
-                let d = (x - from.0).abs().max((y - from.1).abs());
-                if best.is_none_or(|(bd, _)| d < bd) {
-                    best = Some((d, (x, y)));
-                }
-            }
-        }
-    }
-    best.map_or((8, 8), |(_, p)| p)
-}
-
-/// Deterministic starting layout: a grid sweep so a given agent count always
-/// begins the same way.
-pub fn start_positions(count: i32) -> Vec<(i32, i32)> {
-    (0..count).map(|i| (i % GRID, (i / GRID) % GRID)).collect()
-}
 
 /// Village tool-scoring table, indexed by [`Action`] id. Encodes which need
 /// each tool relieves, its persona affinity, and its social role — the scenario
@@ -718,7 +539,7 @@ pub fn run_with_habits(cfg: SoakConfig, habits: bool) -> SoakReport {
     let pack = Rc::new(VillagePack::new());
     let mut world = World::with_pack(cfg.seed, &*pack);
 
-    let positions = start_positions(cfg.agents);
+    let positions = start_positions(cfg.agents.max(0) as usize);
     let ids: Vec<EntityId> = positions.iter().map(|&p| world.spawn(p)).collect();
     let personas: Vec<Persona> = ids.iter().map(|&id| Persona::new(cfg.seed, id)).collect();
     let factions: Vec<u8> = personas.iter().map(|p| p.faction()).collect();
@@ -903,7 +724,7 @@ fn run_neural_logged_with_runtime_expertise(
         .join("norm_stats.json");
     let pack = Rc::new(VillagePack::new());
     let mut world = World::with_pack(cfg.seed, &*pack);
-    let positions = start_positions(cfg.agents);
+    let positions = start_positions(cfg.agents.max(0) as usize);
     let ids: Vec<EntityId> = positions.iter().map(|&p| world.spawn(p)).collect();
     let personas: Vec<Persona> = ids.iter().map(|&id| Persona::new(cfg.seed, id)).collect();
     let mut soul = if omni {

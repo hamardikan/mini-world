@@ -11,6 +11,7 @@ use mw_core::{AgentRng, Intent, KernelPack, Observation, SoulPolicy, World};
 use mw_sim::dialogue::{demo, LlamaDialogue, Scene};
 use mw_sim::director::{self, FfConfig, TICKS_PER_DAY};
 use mw_sim::soak::{self, SoakConfig};
+use mw_runtime::start_positions;
 use mw_neural::ExpertiseLevel;
 use mw_text::{Config, LlamaServerBackend};
 
@@ -186,14 +187,11 @@ impl SoulPolicy for RandomWalk {
     }
 }
 
-fn start_positions(count: i32) -> Vec<(i32, i32)> {
-    (0..count).map(|i| (i % 16, i / 16)).collect()
-}
 
 fn run_kernel(ticks: u64, entities: i32, seed: u64) {
     let pack = KernelPack::new();
     let mut world = World::with_pack(seed, &pack);
-    for pos in start_positions(entities) {
+    for pos in start_positions(entities.max(0) as usize) {
         world.spawn(pos);
     }
     let mut policy = RandomWalk;

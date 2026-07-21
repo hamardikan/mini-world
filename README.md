@@ -2,7 +2,7 @@
 
 A sandbox, semi-AFK simulation platform where **every character is a small on-device AI model**. Characters act through a deterministic world, build memories and relationships, and keep moving while the player is away.
 
-**Status: v0.5 review complete.** The shipped slice is a deterministic village with a utility-AI SOUL stub, shared TEXT rendering, latent dialogue, live LOD, analytic fast-forward, replay, a Ratatui viewer, and a deterministic per-character habit cache. The architecture and ratified contracts are documented in [DESIGN.md](DESIGN.md).
+**Status: v0.5 review complete.** The shipped slice is a deterministic village with a utility-AI SOUL stub, shared TEXT rendering, latent dialogue, live LOD, analytic fast-forward, replay, a Ratatui viewer, and a deterministic per-character habit cache. The architecture and ratified contracts are documented in [DESIGN.md](DESIGN.md). The current viewer is Ratatui/crossterm; a browser simulation observatory and control surface is planned, not shipped. Its implementation-ready first slice is explicitly limited to Phase 0 shared `SimulationController`/hash parity and Phase 1 minimal Snapshot/capabilities, one-tick command, SSE reconnect, and accessible 16x16 Canvas + DOM projection; see the [browser simulation layer plan](docs/web-ui-simulation-plan.md).
 
 ## Architecture at a glance
 
@@ -70,6 +70,8 @@ cargo run -p mw-sim -- view
 
 Viewer keys: **arrows** move focus, **Tab** selects an agent, **j/k** move through conversations, **ENTER** backfills the selected latent row, **Space** pauses/resumes, **1** selects 1× speed, **8** selects 8× speed, **F** fast-forwards one day, and **q** quits. Set `MW_TEXT_LIVE=1` when opening `dialogue` or `view` to use the live TEXT backend.
 
+The current interactive surface is the Ratatui/crossterm TUI. The browser layer is future work and must use the host-owned actor/controller authority described in the [browser simulation layer plan](docs/web-ui-simulation-plan.md); no browser server, frontend, or web asset is shipped.
+
 Live model gates are opt-in because they spawn `llama-server`:
 
 ```sh
@@ -79,6 +81,8 @@ cargo test -- --ignored
 ## Roadmap
 
 **Next: SOUL v1 distillation.** Generate LLM roleplay trajectories and distill them into a **1–5M parameter** policy that plugs into the existing `SoulPolicy` socket.
+
+**Planned future layer:** a loopback-only browser observatory and control surface with JSON HTTP + SSE, fixed per-run provenance, authoritative capabilities, and explicit deterministic command/replay contracts. The first slice is a plan, not a shipped web UI; see [docs/web-ui-simulation-plan.md](docs/web-ui-simulation-plan.md).
 
 Remaining backlog:
 

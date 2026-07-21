@@ -1,0 +1,19 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b1116;
+  --surface: #111a22;
+  --surface-raised: #16232d;
+  --surface-soft: #1a2a33;
+  --line: #2a3b46;
+  --line-strong: #46606d;
+  --text: #d8e6e8;
+  --muted: #91a6ad;
+  --accent: #72d7d0;
+  --accent-strong: #a5f3e9;
+  --warning: #f1c77a;
+  --danger: #f2988c;
+  --success: #a2dfad;
+  --radius: 10px;
+  --mono: "SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace;
+  --sans: "Avenir Next", "Helvetica Neue", Arial, sans-serif;
+}

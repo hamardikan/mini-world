@@ -208,6 +208,12 @@ Measured gates:
 | Latent dialogue | Unobserved conversations make 0 `TextBackend` calls while relationship deltas apply; retroactive backfill is act-coherent and cached; text is one-way and never mutates sim state. |
 | Gates/viewer | 58 tests green after the v0.5 review; `clippy -D warnings`, formatting, and `scripts/demo.sh` are clean; Ratatui TUI was verified in a real PTY and `view --smoke` exits 0 headless. |
 
+### Viewer surfaces
+
+**Current:** the shipped interactive surface is the Ratatui/crossterm viewer. `mw-sim::view::App` owns the live `World`, `VillagePack`, SOUL, Director, conversation ledger, asynchronous TEXT worker, and UI state. Its fast-forward key currently opens a report-only popup and does not mutate the live viewer world.
+
+**Planned:** a browser simulation observatory and control surface is future work. No server, frontend, or web assets exist today. The implementation-ready first slice is exactly Phase 0 shared `SimulationController`/TUI hash parity followed by Phase 1 loopback JSON HTTP + SSE: minimal SnapshotV1, authoritative CapabilitiesV1, only `step {ticks:1}`, SSE reconnect, and an accessible 16x16 Canvas 2D + DOM projection. It uses one actor-owned simulation authority; the browser is never a second world. See the [browser simulation layer plan](docs/web-ui-simulation-plan.md).
+
 ### TEXT bake-off (M4 Pro, 2026-07-15)
 
 The repeatable command is `REPS=3 scripts/bench_text.sh`; it downloads missing GGUFs into `~/.cache/mini-world/models`, runs `llama-bench` with Metal and `-ngl 0` CPU paths, and records `/usr/bin/time -l` maximum RSS. Prompt/decode columns are pp512/tg128 averages over three repetitions; RSS is the real process maximum, not the quantized file size.
@@ -248,11 +254,16 @@ The earlier 82.7% habit hit rate was pre-fix telemetry: cache accounting counted
 - **Single source of truth for fast-forward constants.** Analytic gains are derived from the installed village pack constants; the drift gate remains ≤15% (measured ≤4%).
 - **Post-review health and lifecycle fixes are ratified.** Directional opinion deltas, asynchronous TUI rendering, stale-server reaping, and the narrowed (non-atomic) PID-reuse TOCTOU behavior are part of the v0.5 implementation status.
 
-## Open questions
+## Browser layer decision
 
-1. **Stack**: Rust sim core + Godot front (portable, WASM, FFI to llama.cpp) vs TypeScript/web-first (velocity, WebLLM). Leaning Rust core.
-2. **First scenario**: village social sim (de-risks SOUL breadth + latent dialogue, the novel bet) vs AFK battler (simpler manifest, stresses LOD). Leaning village.
-3. **Multiplayer**: in scope? Escalates determinism from "nice" to mandatory lockstep.
+The browser layer is explicitly planned, not observed. The selected implementation is Rust host actor + loopback HTTP/SSE + JSON + React/TypeScript/Vite, with Canvas 2D and a DOM mirror. Phase 0 proves shared-controller/hash parity; Phase 1 exposes only minimal snapshot, authoritative capabilities, one-tick stepping, SSE reconnect, keyboard selection, status, and reduced motion. The plan resolves command ordering, idempotency, actor/TEXT multiplexing, fixed run provenance, ControlLogV1, authoritative versus seed+ControlLog replay, string encoding for every Rust `u64`, DTO-family versioning, and the synchronous HTTP 200/oneshot boundary. Pause/resume, fast-forward, focus, multi-step, inspector/detail fields, dialogue/TEXT backfill, policy hot-swap, reset/reseed, WebSocket, binary deltas, WASM, and remote exposure are deferred.
+
+## Remaining research questions
+
+The browser contract does not leave implementation-blocking choices open. Broader product research remains:
+
+1. **First scenario beyond the current village:** evaluate whether a future AFK battler should share the same kernel and controller seam.
+2. **Multiplayer:** determine whether a future product needs lockstep networking; it is outside the local browser slice.
 
 ## Research provenance
 

@@ -12,7 +12,6 @@
 //! renders one frame to a `TestBackend` and exits, so CI needs no TTY.
 
 use std::io;
-use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -37,17 +36,15 @@ use mw_agents::dialogue::{
     ConversationLog, DialogueRenderer, FocusPoint, MockRenderer, PersonaCard, PersonaRegistry,
     SliceRegistry, Vocab,
 };
-use mw_agents::habits::{HabitContext, HabitSoul};
-use mw_agents::memory::{Memory, OPINION_ONE};
 use mw_agents::persona::Persona;
-use mw_agents::soul::UtilitySoul;
-use mw_core::{EntityId, Event, World};
+use mw_agents::memory::OPINION_ONE;
+use mw_core::{EntityId, Event};
+use mw_runtime::{RunConfig, SimulationController};
 use mw_text::{Config, LlamaServerBackend};
-use mw_village::{decode, tile_at, Tile, VillagePack, GRID, MAX_NEED};
+use mw_village::{decode, tile_at, Tile, GRID, MAX_NEED};
 
 use crate::dialogue::LlamaDialogue;
-use crate::director::{self, Director, FfConfig, Ring, RingConfig, TICKS_PER_DAY};
-use crate::soak::{self, VillageBody};
+use crate::director::{self, FfConfig, RingConfig, TICKS_PER_DAY};
 
 /// How the viewer is opened.
 #[derive(Clone, Copy, Debug)]
@@ -190,16 +187,12 @@ struct PendingRender {
     source: RenderSource,
 }
 
-/// Everything the viewer owns: the live sim (`pack`/`world`/`soul`), the LOD
-/// director, the conversation ledger, and the UI cursor state.
+/// Everything the viewer owns: the runtime controller plus render-only UI state.
 pub struct App {
     cfg: ViewConfig,
-    pack: Rc<VillagePack>,
-    world: World,
+    controller: SimulationController,
     ids: Vec<EntityId>,
     positions: Vec<(i32, i32)>,
-    soul: HabitSoul<UtilitySoul<VillageBody>>,
-    director: Director,
     registry: SliceRegistry,
     vocab: Vocab,
     log: ConversationLog,
@@ -209,7 +202,6 @@ pub struct App {
     selected: usize,
     dlg_sel: usize,
     speed: Speed,
-    last_events: usize,
     feed: Vec<String>,
     popup: Option<String>,
     map_area: Rect,
@@ -217,35 +209,18 @@ pub struct App {
 
 impl App {
     pub fn new(cfg: ViewConfig) -> Self {
-        // Mirror the soak's wiring so the viewer runs the exact same sim, then
-        // hold the pieces together via an `Rc` pack (the soul's body shares it)
-        // so nothing is a self-referential borrow.
-        let pack = Rc::new(VillagePack::new());
-        let mut world = World::with_pack(cfg.seed, &*pack);
-        let positions = soak::start_positions(cfg.agents);
-        let ids: Vec<EntityId> = positions.iter().map(|&p| world.spawn(p)).collect();
-        let personas: Vec<Persona> = ids.iter().map(|&id| Persona::new(cfg.seed, id)).collect();
-        let factions: Vec<u8> = personas.iter().map(|p| p.faction()).collect();
-        let memories: Vec<Memory> = ids
+        let controller = SimulationController::new(RunConfig {
+            seed: cfg.seed,
+            agents: cfg.agents.max(0) as usize,
+            ..RunConfig::default()
+        });
+        let ids = controller.agent_ids().to_vec();
+        let positions = controller.positions().to_vec();
+        let personas: Vec<Persona> = ids
             .iter()
-            .map(|&id| Memory::new(id, soak::verb_affect()))
+            .map(|&id| Persona::new(cfg.seed, id))
             .collect();
         let registry = SliceRegistry::village(&personas);
-        let body = VillageBody::new(Rc::clone(&pack), factions);
-        let soul = HabitSoul::with_hit_hook_and_tool(
-            UtilitySoul::new(
-                body,
-                soak::tool_table(),
-                ids.clone(),
-                personas,
-                memories,
-                positions.clone(),
-            ),
-            ids.clone(),
-            UtilitySoul::<VillageBody>::habit_replay_tool,
-            UtilitySoul::<VillageBody>::last_tool,
-        );
-        let director = Director::new(RingConfig::default(), ids.len(), (8, 8));
         // The live backend is expensive (spawns llama-server + model); only pay
         // for it when explicitly asked, and fall back to the mock on failure.
         let text = if cfg.live {
@@ -259,12 +234,9 @@ impl App {
         let renderer = RenderWorker::new(text);
         Self {
             cfg,
-            pack,
-            world,
+            controller,
             ids,
             positions,
-            soul,
-            director,
             registry,
             vocab: Vocab::village(),
             log: ConversationLog::new(),
@@ -274,7 +246,6 @@ impl App {
             selected: 0,
             dlg_sel: 0,
             speed: Speed::Normal,
-            last_events: 0,
             feed: Vec::new(),
             popup: None,
             map_area: Rect::default(),
@@ -282,8 +253,12 @@ impl App {
     }
 
     fn pos(&self, id: EntityId) -> (i32, i32) {
-        self.world.entity(id).map(|e| e.pos).unwrap_or((0, 0))
+        self.positions
+            .get(id.index() as usize)
+            .copied()
+            .unwrap_or((0, 0))
     }
+
 
     /// The focus observation predicate: the same one latent dialogue uses, sized
     /// to the director's hot radius so what the camera renders matches what the
@@ -292,63 +267,17 @@ impl App {
         FocusPoint::new(self.focus, RingConfig::default().hot_radius)
     }
 
-    /// Advance the live sim one tick: step the kernel, route events to memory,
-    /// the conversation ledger, and the feed, refresh the director rings, then
-    /// render any conversation the focus now observes (attention-gating).
+    /// Advance exactly one authoritative runtime tick and route its projection
+    /// into render-only feed, conversation, and position state.
     fn step(&mut self) {
-        // LOD gate: only hot (every tick) and warm (on cadence) entities run
-        // SOUL; cold entities idle-extrapolate. The director's rings were set by
-        // the previous tick's update, so they gate this tick's decisions.
-        for &id in &self.ids {
-            let (h, en, so) = self.pack.needs(id).project(self.world.tick());
-            let pos = self.world.entity(id).map(|e| e.pos).unwrap_or_default();
-            let cell_class = match tile_at(pos) {
-                Tile::Empty => 0,
-                Tile::Home => 1,
-                Tile::Bakery => 2,
-                Tile::Well => 3,
-                Tile::Field => 4,
-            };
-            self.soul.set_context(
-                id,
-                HabitContext {
-                    needs: [h as i16, en as i16, so as i16],
-                    need_max: MAX_NEED as i16,
-                    cell_class,
-                    goal: 0,
-                },
-            );
-        }
-        self.soul.inner_mut().snapshot(&self.world);
-        let director = &self.director;
-        self.world
-            .step_gated(&*self.pack, &mut self.soul, |id, tick| {
-                director.should_run_soul(id.index() as usize, tick)
-            });
-        let end = self.world.event_log().len();
-        // Clone the tick's new events out so the borrow of the world ends before
-        // we touch other fields.
-        let new: Vec<Event> = self.world.event_log()[self.last_events..end].to_vec();
-        self.last_events = end;
-        self.soul.inner_mut().observe_events(&new);
-        self.soul.observe_events(&new);
-        let tick = self.world.tick();
-        for ev in &new {
+        let outcome = self.controller.step_one();
+        self.positions = self.controller.positions().to_vec();
+        self.log.ingest(&outcome.events);
+        for ev in &outcome.events {
             if let Some(line) = self.notable(ev) {
                 self.feed.push(line);
             }
-            // Drama pulls a character back to full fidelity (DESIGN §10).
-            if is_notable(ev) {
-                self.director.note_event(actor(ev).index() as usize, tick);
-            }
         }
-        self.soul.inner_mut().decay_opinions();
-        for (slot, &id) in self.ids.iter().enumerate() {
-            if let Some(e) = self.world.entity(id) {
-                self.positions[slot] = e.pos;
-            }
-        }
-        self.director.update(&self.positions, tick);
         self.render_observed();
         // Keep the feed bounded; it is a scrolling tail, not a full ledger.
         if self.feed.len() > 500 {
@@ -488,10 +417,9 @@ impl App {
     fn move_focus(&mut self, dx: i32, dy: i32) {
         self.focus.0 = (self.focus.0 + dx).clamp(0, GRID - 1);
         self.focus.1 = (self.focus.1 + dy).clamp(0, GRID - 1);
-        self.director.set_focus(self.focus);
+        self.controller.set_focus(self.focus);
     }
 
-    /// Handle one key. Returns `true` when the viewer should quit.
     fn on_key(&mut self, code: KeyCode) -> bool {
         // A popup swallows the next key (except quit).
         if self.popup.is_some() {
@@ -545,10 +473,11 @@ impl App {
         let y = row as i32 - (a.y as i32 + 1);
         if (0..GRID).contains(&x) && (0..GRID).contains(&y) {
             self.focus = (x, y);
-            self.director.set_focus(self.focus);
+            self.controller.set_focus(self.focus);
             if let Some(slot) = self.positions.iter().position(|&p| p == (x, y)) {
                 self.selected = slot;
             }
+            self.controller.set_focus(self.focus);
         }
     }
 }
@@ -563,10 +492,6 @@ fn actor(ev: &Event) -> EntityId {
     }
 }
 
-/// Whether an event is dramatic enough to pin its actor hot.
-fn is_notable(ev: &Event) -> bool {
-    matches!(ev, Event::Spoke { .. } | Event::Interacted { .. })
-}
 
 fn actor_name(ev: &Event, reg: &SliceRegistry) -> String {
     reg.card(actor(ev)).name.clone()
@@ -603,11 +528,11 @@ fn describe(ev: &Event, reg: &SliceRegistry, vocab: &Vocab) -> String {
     }
 }
 
-fn ring_color(r: Ring) -> Color {
+fn ring_color(r: u8) -> Color {
     match r {
-        Ring::Hot => Color::LightRed,
-        Ring::Warm => Color::Yellow,
-        Ring::Cold => Color::Blue,
+        2 => Color::LightRed,
+        1 => Color::Yellow,
+        _ => Color::Blue,
     }
 }
 
@@ -651,7 +576,7 @@ fn render_map(f: &mut Frame, area: Rect, app: &App) {
     for (slot, &(x, y)) in app.positions.iter().enumerate() {
         if (0..GRID).contains(&x) && (0..GRID).contains(&y) {
             let idx = (y * GRID + x) as usize;
-            let better = occ[idx].is_none_or(|o| app.director.ring(slot) > app.director.ring(o));
+            let better = occ[idx].is_none_or(|o| app.controller.ring(slot) > app.controller.ring(o));
             if better {
                 occ[idx] = Some(slot);
             }
@@ -671,7 +596,7 @@ fn render_map(f: &mut Frame, area: Rect, app: &App) {
                     let (ch, color) = tile_glyph(tile);
                     Span::styled(ch.to_string(), Style::default().fg(color))
                 } else {
-                    let ring = app.director.ring(slot);
+                    let ring = app.controller.ring(slot);
                     let name = &app.registry.card(app.ids[slot]).name;
                     let glyph = name.chars().next().unwrap_or('@');
                     let mut style = Style::default()
@@ -712,10 +637,10 @@ fn tile_glyph(t: Tile) -> (char, Color) {
 fn render_inspector(f: &mut Frame, area: Rect, app: &App) {
     let s = app.selected;
     let id = app.ids[s];
-    let tick = app.world.tick();
+    let tick = app.controller.tick();
     let card = app.registry.card(id);
-    let mem = app.soul.inner().memory(s);
-    let (h, en, so) = app.pack.needs(id).project(tick);
+    let mem = app.controller.memory(s).expect("selected agent memory");
+    let (h, en, so) = app.controller.needs(id);
 
     let mut lines = vec![
         Line::from(Span::raw(card.summary.clone())),
@@ -764,7 +689,7 @@ fn render_inspector(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let last = app
-        .world
+        .controller
         .event_log()
         .iter()
         .rev()
@@ -773,7 +698,7 @@ fn render_inspector(f: &mut Frame, area: Rect, app: &App) {
         .unwrap_or_else(|| "idle".to_string());
     lines.push(Line::from(format!("last action: {last}")));
 
-    let title = format!(" Agent #{s} {} [{:?}] ", card.name, app.director.ring(s));
+    let title = format!(" Agent #{s} {} [ring={}] ", card.name, app.controller.ring(s));
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: true });
@@ -843,7 +768,7 @@ fn render_dialogue(f: &mut Frame, area: Rect, app: &App) {
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
     let text = format!(
         " tick={} [{}]  q:quit  arrows:focus  Tab:agent  j/k:dialogue  ENTER:render  Space:pause  1:1x  8:8x  F:fast-forward ",
-        app.world.tick(),
+        app.controller.tick(),
         app.speed.label(),
     );
     let p = Paragraph::new(text)

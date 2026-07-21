@@ -9,6 +9,8 @@ members = [
     "crates/mw-agents",
     "crates/mw-text",
     "crates/mw-sim",
+    "crates/mw-runtime",
+    "crates/mw-host",
     "crates/mw-neural",
 ]
 

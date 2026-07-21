@@ -29,7 +29,7 @@ use mw_village::{
     VillagePack, MAINTENANCE_CYCLE, MAINTENANCE_GAIN, MAX_NEED, NEED_DECAY, STARVE_TICKS,
 };
 
-use crate::soak::start_positions;
+use mw_runtime::start_positions;
 
 /// In-game-time unit, defined in exactly one place: one tick is one in-game
 /// second, so a day is 86 400 ticks. Everything time-shaped (a "week" of
@@ -327,7 +327,7 @@ pub fn fast_forward(cfg: FfConfig) -> FfReport {
 
     // Same deterministic setup as the hot soak, so a fast-forward and a fully
     // hot run of the same seed start from an identical population.
-    let positions = start_positions(cfg.agents);
+    let positions = start_positions(cfg.agents.max(0) as usize);
     let ids: Vec<EntityId> = positions.iter().map(|&p| world.spawn(p)).collect();
     let personas: Vec<Persona> = ids.iter().map(|&id| Persona::new(cfg.seed, id)).collect();
     let n = ids.len();

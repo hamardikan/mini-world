@@ -4,6 +4,7 @@ use mw_agents::persona::Persona;
 use mw_agents::soul::{DecisionTrace, UtilitySoul};
 use mw_core::{EntityId, Event, Intent, LogEntry, SoulPolicy, World};
 use mw_village::{tile_at, Action, Tile, VillagePack, MAX_NEED};
+use mw_runtime::{start_positions, VillageBody};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::File;
@@ -427,8 +428,8 @@ fn persona_record(p: Persona) -> PersonaRecord {
 }
 
 enum ExportSoul {
-    Plain(UtilitySoul<crate::soak::VillageBody>),
-    Habits(HabitSoul<UtilitySoul<crate::soak::VillageBody>>),
+    Plain(UtilitySoul<VillageBody>),
+    Habits(HabitSoul<UtilitySoul<VillageBody>>),
 }
 impl ExportSoul {
     fn snapshot(&mut self, w: &World) {
@@ -485,7 +486,7 @@ fn make_policy(
         .map(|&id| mw_agents::memory::Memory::new(id, crate::soak::verb_affect()))
         .collect();
     let mut u = UtilitySoul::new(
-        crate::soak::VillageBody::new(pack, factions),
+        VillageBody::new(pack, factions),
         crate::soak::tool_table(),
         ids.to_vec(),
         ps.to_vec(),
@@ -497,9 +498,9 @@ fn make_policy(
         ExportSoul::Habits(HabitSoul::with_hit_hook_and_tool_and_trace(
             u,
             ids.to_vec(),
-            UtilitySoul::<crate::soak::VillageBody>::habit_replay_tool,
-            UtilitySoul::<crate::soak::VillageBody>::last_tool,
-            UtilitySoul::<crate::soak::VillageBody>::record_replay,
+            UtilitySoul::<VillageBody>::habit_replay_tool,
+            UtilitySoul::<VillageBody>::last_tool,
+            UtilitySoul::<VillageBody>::record_replay,
         ))
     } else {
         ExportSoul::Plain(u)
@@ -632,7 +633,7 @@ pub fn export_trajectories_profile(
     }
     let pack = Rc::new(VillagePack::new());
     let mut world = World::with_pack(seed, &*pack);
-    let positions = crate::soak::start_positions(agents);
+    let positions = start_positions(agents.max(0) as usize);
     let ids: Vec<_> = positions.iter().map(|&p| world.spawn(p)).collect();
     seed_profile(&pack, &ids, seed, profile, fraction);
     let personas: Vec<_> = ids.iter().map(|&id| Persona::new(seed, id)).collect();
